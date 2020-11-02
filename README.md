@@ -25,28 +25,30 @@ python3.6 -m venv venv_ALICE
 4. Install dependencies
 Perhaps need:
 ```
-apt-get install swig cmake libopenmpi-dev zlib1g-dev ffmpeg
+sudo apt-get install swig cmake libopenmpi-dev zlib1g-dev ffmpeg build-essential
 ```
 Definitely need
 ```
 pip install --upgrade pip
 pip install -r requirements.txt
+pip install -e git+https://github.com/openai/baselines#egg=baselines
 ```
 5. Install mujoco (if you're into that.) Be sure to place mjkey.txt into the ~/.mujoco/ folder.
 ```
 wget https://www.roboti.us/download/mjpro150_linux.zip
 mkdir ~/.mujoco
 unzip mjpro150_linux.zip -d ~/.mujoco
-sudo apt install python3.x-dev patchelf
+sudo apt install python3.6-dev patchelf
 echo 'export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so' >> ~/.bashrc
-echo 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/.mujoco/mujoco150/bin:/usr/lib/nvidia-418' >> ~/.bashrc
-pip install mujoco_py
+echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/.mujoco/mjpro150/bin:/usr/lib/nvidia-418' >> ~/.bashrc
+(may possibly need) sudo apt-get install libosmesa6-dev
+pip install -U "mujoco-py<1.50.2>=1.50.1"
 ```
 6. Install rl-baselines-zoo (the `sed` command changes a line in `train.py`)
 ```
 git clone https://github.com/araffin/rl-baselines-zoo.git
 mv rl-baselines-zoo rl_baselines_zoo
-sed -n '131 c\    with open(os.path.join(os.path.dirname(__file__),"hyperparams/{}.yml".format(args.algo)), "r") as f:' rl_baselines_zoo/train2.txt
+sed -n '131 c\    with open(os.path.join(os.path.dirname(__file__),"hyperparams/{}.yml".format(args.algo)), "r") as f:' rl_baselines_zoo/train.py
 ```
 
 ### Potential errors/solutions (largely with mujoco)
