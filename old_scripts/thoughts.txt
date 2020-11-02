@@ -1,0 +1,39 @@
+Loss functions and their algorithms:
+
+BC:
+    Require: expert demo dataset D_E = {(s_t,a_t)}
+    pi_L = argmin_pi \sum_{D_E} pi(s_t) != a_t
+Causal BC:
+    Same as BC, but with s_t = [s_t,a_{t-1}]
+DAgger:
+    Require: expert labeler pi_E
+    initialize pi_0 arbitrarily and D_L = {}
+    for n = 0:N-1
+        generate traj under pi_n and add to D_L
+        pi_{n+1} = argmin_pi \sum_{D_L} pi(s_t) != pi_E(a_t)
+DaD:
+    Require: expert demo dataset D_E
+    initialize pi_0 arbitrarily
+    for n = 0:N-1
+        xi = new traj under pi_n (keys(xi[t]) = 's','a')
+        pi_{n+1} = argmin_pi \sum_{D_E} xi[t]['a'] != 
+        
+
+DAD in Arun's paper is modelling transition p(x_t+1|x_t). I wish to model p(a_t|x_t)
+Tomorrow: KEep reading DaD, implement DAgger
+
+Hey Arun (and Sanjiban and anyone else who's interested), I've been reading through your DaD papers and I'm working on implementing it today, but I just wanted to clarify a few things. I'm going to explain the approach as I understand it (writing this out explicitly helps me understand things) and if you could correct any mistakes I'd appreciate it.
+DaD as you've written it is focused on learning a system model P(x'|x) given some observation trajs D, but we're interested in using it to learn pi_E(a|s) given observation trajs.
+We know that IL suffers compounding of errors due to distributional mismatch. For (s,a,s'), a small error in a results in a s' distribution at test time that is much different than the s' distributon at train time.
+DaD for p(x'|x) generates a sequence of predictions from a given initial state (use x_{iternum} to denote predicted sequence) based on the current model. Let x_E be a demonstration trajectory, and we initially build a 
+At iteration n, We use D, initially composed of x,x' pairs of x_E[0:T] to train M_n, then generate predicted sequence x_n[1:T] by beginning at x_E[0] and applying M_n repeatedly.
+The secret sauce is right in the next part, which coerces the poor predictions back to the desired distribution by aggregating mixed pairs x_n[t],x_E[t+1] into D. 
+
+
+So as I understand it the alg is as follows:
+    Initialize {xi_k} pi_E trajs and D = {(s,a)} from pi_E trajs
+    pi_0 = argmin_pi sum_D pi(s) != a
+    for n = 0:N-1
+        for k=1:K
+            a_L[1:T] = predict(xi_k[s[0]],
+        
