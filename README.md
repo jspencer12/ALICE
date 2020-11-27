@@ -53,9 +53,11 @@ sed -n '131 c\    with open(os.path.join(os.path.dirname(__file__),"hyperparams/
 
 ### Potential errors/solutions (largely with mujoco)
 Error: `GLEW initalization error: Missing GL version`
+
 Solution: `export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so`
 
 Error: `Qobject movetothread ...`
+
 Solution:
 ```
 pip list|grep opencv-python
@@ -63,9 +65,11 @@ pip uninstall opencv-python
 pip install opencv-python==4.3.0.36
 ```
 
-## Run the script!
-python ALICE.py
 
+## Run the script!
+```
+python ALICE.py
+```
 
 ### FYI
 All this code is written with eager execution. If you train and load an expert through rl_baselines_zoo, that's not a problem, but if you train the expert with stablebaselines, that might be a challenge, and you might need to run the expert once to generate the cached demo trajs, and then another separate session to run IL on those cached demos.
@@ -73,3 +77,21 @@ All this code is written with eager execution. If you train and load an expert t
 The gym-CIL folder has the LQR environment, which you can try playing with if you want.
 I haven't gotten it integrated yet since it's a continuous action space, but I'll get there soon. To install it:
 cd gym-CIL && python -m pip install -e .
+
+### For WSL:
+Install VcXsrv
+
+Add the following to `~/.bashrc`:
+``` 
+export DISPLAY=$(ip route | awk '{print $3; exit}'):0
+export LIBGL_ALWAYS_INDIRECT=0
+```
+When running XLaunch always check the box "Disable access control" and uncheck the box "Native opengl"
+
+### Jupyter Notebooks:
+Install it: `pip install jupyterlab`
+Then run it: `jupyter-lab`
+If you installed it within your venv, then it should be running natively in that context. If you need to add your venv to it, follow these instructions:
+https://janakiev.com/blog/jupyter-virtual-envs/
+
+

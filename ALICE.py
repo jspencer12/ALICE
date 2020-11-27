@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import argparse
 pd.options.display.float_format = '{:.2f}'.format
 pd.options.display.precision = 2
 import tensorflow as tf
@@ -12,7 +13,7 @@ from matplotlib import animation
 from matplotlib.ticker import ScalarFormatter
 from matplotlib.patches import Polygon
 import gym
-import time, os, itertools, sys, pickle, yaml, subprocess,copy
+import time, os, itertools, sys, pickle, yaml, subprocess, copy, portalocker
 from scipy.special import softmax
 
 from stable_baselines.common.tf_layers import conv_to_fc,linear
@@ -267,9 +268,40 @@ def get_zoo_model(env_id,RL_algo=None,RL_expert_folder=None,exp_id=0,load_best=F
     load_env = None if RL_algo == 'acer' else env
     model = ALGOS[RL_algo].load(model_path, env=load_env)
     return model
+def eval_pi_lightweight(policy,env_id,N_traj=1,render=False,run_seed=None,vec_env=False,obs_preprocess=None,verbose=0):
+    env = make_env(env_id,vec_env)
+    np.random.seed()
+    run_seed = np.random.randint(10000) if run_seed is None else run_seed
+    env.seed(run_seed)
+    episode_rews = []
+    start = time.time()
+    for traj_num in range(N_traj):
+        env_state, env_state_prev, action_prev, E_inds, t = None, None, None, None, 0
+        obs = reset_env(env,env_state,env_state_prev,action_prev)
+        obs_proc = obs_preprocess(obs,action_prev=action_prev,env_state=env_state,env_id=env_id) if obs_preprocess is not None else obs
+        episode_rew, done = 0,False
+        while not done:
+            obs_proc = obs_preprocess(obs,action_prev=action_prev,env_state=env_state,env_id=env_id) if obs_preprocess is not None else obs
+            action = policy(obs_proc)
+            if render:
+                env.render(); time.sleep(.02)
+            obs_next, rew, done, _ = env.step(action)
+            rew = rew[0] if vec_env else rew
+            env_state_next = get_state(env)
+            env_state,obs,action_prev,env_state_prev = env_state_next,obs_next,action,env_state
+            t += 1
+            episode_rew += rew
+        episode_rews.append(episode_rew)
+        if verbose>1:
+            print("Episode {}, {} steps ({:.1f} steps/sec) reward: {}".format(traj_num+1,t,t/(time.time()-ep_start_time),episode_rew))
+    if verbose > 0:
+        print("{} episodes, ({:.1f} min) Avg reward {:.1f}+-{:.1f},".format(N_traj,(time.time()-start)/60,np.mean(episode_rews),np.std(episode_rews)))
+    env.close()
+    return np.mean(episode_rews),np.std(episode_rews)
 
 def get_trajectories(policy,env_id,N_traj=1,path=None,render=False,verbose=0,df_agg=None,df_E=None,pair_with_E=False,
-                     obs_preprocess=None,T_max=None,seed=None,obs_postprocess=None,vec_env=False,gif_path=None,init_ts=None,expert_after_n=1e10,policy_e=None,e_prepro=None):
+                     obs_preprocess=None,T_max=None,seed=None,obs_postprocess=None,vec_env=False,gif_path=None,init_ts=None,expert_after_n=1e10,policy_e=None,e_prepro=None,
+                     randinit_t=False,horizon=None,choose_random_expert=False):
 
     df_columns = ['obs','obs_next','state','state_next','state_prev','action','action_prev','rew','t','traj_ind','weight_action','weight','E_ind']
 
@@ -301,21 +333,36 @@ def get_trajectories(policy,env_id,N_traj=1,path=None,render=False,verbose=0,df_
     np.random.seed()
     run_seed = np.random.randint(10000) if seed is None else seed
     env.seed(run_seed)
+    np.random.seed(seed)
     episode_rews = []
     start = time.time()
     samp_list = []
-    for traj_num in range(n_traj_loaded,N_traj):
+    traj_nums = np.arange(n_traj_loaded,N_traj)
+    if choose_random_expert and pair_with_E and df_E is not None:
+        traj_nums = np.random.permutation(pd.unique(df_E['traj_ind']))[:N_traj-n_traj_loaded]
+        print('random expert traj nums',traj_nums)
+    for traj_num in traj_nums:
 
         #Handle initialization of initial state and previous action
         env_state, env_state_prev, action_prev, E_inds, t, T_max = None, None, None, None, 0, T_max or 100000
-        if pair_with_E and df_E is not None:
+        if 0: #pair_with_E and df_E is not None:
             t_init = init_ts[traj_num] if init_ts is not None else 0
             E_inds = df_E[df_E['t']>=t_init][df_E['traj_ind']==traj_num].index
             if len(E_inds)>0:
                 T_max = df_E['t'].loc[E_inds].max()
                 env_state,env_state_prev,action_prev,t = df_E[['state','state_prev','action_prev','t']].loc[E_inds[0]]
+        if pair_with_E and df_E is not None:
+            len_E = df_E['t'][df_E['traj_ind']==traj_num].max()
+            max_t_init = len_E if horizon is None else max(1,len_E-horizon)
+            t_init = 0 if not randinit_t else np.random.randint(max_t_init)
+            t = t_init
+            ind_init = df_E[df_E['traj_ind']==traj_num][df_E['t']==t_init].index[0]
+            T_max = max_t_init if horizon is None else t_init + horizon
+            env_state,env_state_prev,action_prev,t = df_E[['state','state_prev','action_prev','t']].loc[ind_init]
+            #print('t_range',t,T_max)
             
         obs = reset_env(env,env_state,env_state_prev,action_prev)
+        env_state = get_state(env)
         obs_proc = obs_preprocess(obs,action_prev=action_prev,env_state=env_state,env_id=env_id) if obs_preprocess is not None else obs
         #obs_deque = deque([np.zeros_like(obs_proc)]*4,maxlen=4)
         episode_rew, done = 0,False
@@ -375,6 +422,7 @@ def get_trajectories(policy,env_id,N_traj=1,path=None,render=False,verbose=0,df_
         if verbose>0:
             print('Saved {} trajs to {}'.format(N_traj,path))
     env.close()
+    #np.random.seed()
     return traj_df
 
 def make_gif(img_array,gif_path):
@@ -427,7 +475,7 @@ def keras_NN(Obs_shape,A_dim,H_dims=[8],linear=True,seed=None,n_components=1,cnn
         for i in range(1,len(H_dims)):
             model.add(tf.keras.layers.Dense(H_dims[i],activation='relu',kernel_initializer=initializer, bias_initializer=initializer,
                                         kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg))
-        model.add(tf.keras.layers.Dense(A_dim,kernel_initializer=initializer,activation='tanh',
+        model.add(tf.keras.layers.Dense(A_dim,kernel_initializer=initializer,#activation='tanh',
                                         kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg))
         if clip_range is not None:
             print(clip_range)
@@ -438,35 +486,42 @@ def clone_model_and_weights(old_model):
     new_model.set_weights(old_model.get_weights())
     return new_model
 
-def train_model(model,dataframe,loss,learning_rate,N_epoch=20,batch_size=32,save_best_intermediate=False,model_prob_a=None,
+def train_model(model,dataframe,loss,learning_rate,N_epoch=20,batch_size=32,save_best_intermediate=False,model_prob_a=None,entropy_coeff=None,
                 steps_per_epoch=None,verbose=0,seed=None,delta=1e-6,adversary_f=None,df_test=None,test_loss=None,recompute_adversary=None):
     '''trains keras model, either by taking N_epoch*steps_per_epoch optimization
        steps or until step size drops below delta'''
-
+    is_fail = 'is_expert' in dataframe.columns
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     dataframe['loss'] = np.zeros((len(dataframe),))
     dataframe['adversary'] = np.ones((len(dataframe),))
     dataframe['adversary_E'] = np.zeros((len(dataframe),))
     dataframe['model_prob_a'] = np.zeros((len(dataframe),))
     dataframe['model_a'] = np.zeros((len(dataframe),))
-    train_loss_results = []
+    model_a = lambda model_out,a: tf.gather_nd(model_out,a,batch_dims=1)
+    dataframe['model_act_pre'] = -1*np.ones((len(dataframe),))
+    dataframe['model_act_post']= -1*np.ones((len(dataframe),))
+    train_results = dict()
+    train_losses = []
     steps_per_epoch = steps_per_epoch or len(dataframe) #if None, take num_samp steps
     np.random.seed(seed)
     tf.compat.v1.set_random_seed(seed); np.random.seed(seed)
     last_loss = 1e9
     print_freq = 10000
     start_time = time.time()
+    dataframe['model_act_pre'] = np.argmax(batch_eval(model,np.vstack(dataframe['obs'].to_numpy())),axis=-1)
+    best_weights = model.get_weights()
+    best_ind = 0
     for epoch in range(N_epoch):
         epoch_loss_avg = tf.keras.metrics.Mean()
         random_inds = itertools.cycle(np.random.permutation(dataframe.index.values)) #random shuffle inds
-        if 'is_expert' in dataframe.columns:
+        if is_fail:
             #print('All samps :',len(dataframe.index.values),'Subset:',len(dataframe[dataframe['is_expert']==False].index.values))
             random_inds = itertools.cycle(np.random.permutation(dataframe[dataframe['is_expert']==False].index.values)) #random shuffle inds
         n_steps,print_count = 0,0
         while n_steps<steps_per_epoch:
             batch_indices = [next(random_inds) for i in range(min(batch_size,steps_per_epoch-n_steps))]
             with tf.GradientTape() as tape:
-                loss_value = loss(model, dataframe.loc[batch_indices], adversary_f,model_prob_a)
+                loss_value = loss(model, dataframe.loc[batch_indices], adversary_f,model_prob_a,entropy_coeff=entropy_coeff)
                 grads = tape.gradient(loss_value, model.trainable_variables)
             #Apply gradient
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
@@ -474,28 +529,69 @@ def train_model(model,dataframe,loss,learning_rate,N_epoch=20,batch_size=32,save
             dataframe.loc[batch_indices,'loss'] = loss_value.numpy()
             epoch_loss_avg.update_state(loss_value)  # Add list of current losses
             n_steps += len(batch_indices)
-            #Refit adversary
-            if recompute_adversary is not None:
-                adversary_f = recompute_adversary(model)
-                dataframe['adversary'] = adversary_f(np.vstack(dataframe['obs_next_ref'].to_numpy()))
-                dataframe['adversary_E'] = adversary_f(np.vstack(dataframe['obs_next_E'].to_numpy()))
-                dataframe['model_prob_a'] = batch_model_prob_a(model_prob_a,model,
-                                                               np.vstack(dataframe['obs'].to_numpy()),
-                                                               tf.cast(np.vstack(dataframe['action_ref'].to_numpy()),tf.int32))
-                model_a = lambda model_out,a: tf.gather_nd(model_out,a,batch_dims=1)
-                dataframe['model_a'] = batch_model_prob_a(model_a,model,
-                                                          np.vstack(dataframe['obs'].to_numpy()),
-                                                          tf.cast(np.vstack(dataframe['action_ref'].to_numpy()),tf.int32))
-        train_loss_results.append(epoch_loss_avg.result())
+            #Refit adversary after each gradient step (or after each epoch)
+        if recompute_adversary is not None:
+            adversary_f = recompute_adversary(model)
+
+        #FAIL takes the model with the lowest utility in the game
+        train_losses.append(epoch_loss_avg.result().numpy())
+        min_ind = np.argmin(train_losses)
+        if train_losses[-1]<=train_losses[min_ind]:
+            best_weights = model.get_weights()
+            best_ind = min_ind
+            
         if verbose>1:
+            if dataframe.isnull().values.any():
+                print(dataframe.isnull().sum(axis=0))
             tl_str = ' Test Loss: {:.3f}'.format(batch_loss(test_loss,model,df_test)) if df_test is not None else ''
             print("Epoch {:03d}: Train Loss: {:.3f}{}".format(epoch+1,epoch_loss_avg.result(),tl_str))
-        if ('is_expert' in dataframe.columns) and 1:
+
+        #Debug printing
+        if is_fail and 1:
             N=20
-            print(dataframe[['obs','action','action_ref','action_ref_prob','adversary','adversary_E','model_prob_a','model_a','loss','E_ind']][dataframe['model_prob_a']==1.0].sort_values('E_ind')[:N])
-            print(dataframe[['obs','action','action_ref','action_ref_prob','adversary','adversary_E','model_prob_a','model_a','loss','E_ind']].sort_values('E_ind')[:N])
-        
+            dataframe['adversary'] = adversary_f(np.vstack(dataframe['obs_next_ref'].to_numpy()))
+            dataframe['adversary_E'] = adversary_f(np.vstack(dataframe['obs_next_E'].to_numpy()))
+            obs = np.vstack(dataframe['obs'].to_numpy())
+            action_ref = tf.cast(np.vstack(dataframe['action_ref'].to_numpy()),tf.int32)
+            dataframe['model_prob_a'] = batch_model_func_out_a(model_prob_a,model,obs,action_ref)
+            dataframe['chosen'] = dataframe['model_prob_a']>.5
+            dataframe['model_a'] = batch_model_func_out_a(model_a,model,obs,action_ref)
+            print('Chosen: loss {:.3g}, f val {:.3g}, Other: loss {:.3g}, f val {:.3g}'.format(
+                   dataframe[dataframe['chosen']]['loss'].sum(),
+                   dataframe[dataframe['chosen']]['adversary'].sum(),
+                   dataframe[~dataframe['chosen']]['loss'].sum(),
+                   dataframe[~dataframe['chosen']]['adversary'].sum()))
+            print(dataframe['adversary'].min(),dataframe['adversary'].max(),dataframe['adversary'].mean(),dataframe['adversary'].std())
+            #print(dataframe[['obs','action','action_ref','action_ref_prob','adversary','adversary_E','model_prob_a','model_a','loss','E_ind']][(dataframe['model_prob_a']==1.0) & (dataframe['action_ref']==0) & ~dataframe['is_expert']].sort_values('E_ind'))
+            #print(dataframe[['obs','action','action_ref','action_ref_prob','adversary','adversary_E','model_prob_a','model_a','loss','E_ind']][(dataframe['model_prob_a']==1.0) & (dataframe['action_ref']==1) & ~dataframe['is_expert']].sort_values('E_ind'))
+            #print(dataframe[['obs','action','action_ref','action_ref_prob','adversary','adversary_E','model_prob_a','model_a','loss','E_ind']].sort_values('E_ind')[:N])
+
+    #Done training, update with best weights
+    if is_fail:
+        dataframe['adversary'] = adversary_f(np.vstack(dataframe['obs_next_ref'].to_numpy()))
+        model.set_weights(best_weights)
+    
+    dataframe['model_act_post'] = np.argmax(batch_eval(model,np.vstack(dataframe['obs'].to_numpy())),axis=-1)
+    actions = tf.cast(np.vstack(dataframe['action_ref'].to_numpy()),tf.int32) if recompute_adversary is not None else tf.cast(np.vstack(dataframe['action'].to_numpy()),tf.int32)
+    dataframe['model_a'] = batch_model_func_out_a(model_a,model,np.vstack(dataframe['obs'].to_numpy()),actions)
+    dataframe['model_prob_a'] = batch_model_func_out_a(model_prob_a,model,np.vstack(dataframe['obs'].to_numpy()),actions)
+    dataframe['chosen'] = dataframe['model_prob_a']>.5
+    prob = dataframe[dataframe['is_expert']==False]['model_prob_a'] if ('is_expert' in dataframe.columns) else dataframe['model_prob_a']
+    logit = dataframe[dataframe['is_expert']==False]['model_a'] if ('is_expert' in dataframe.columns) else dataframe['model_a']
+    train_results['entropy'] = -(prob*prob.apply(np.log)).mean()
+    train_results['entropy_coeff'] = entropy_coeff
+    train_results['num_switched'] = len(dataframe[dataframe['model_act_pre']!=dataframe['model_act_post']])
+    train_results['epoch_losses'] = train_losses
+    train_results['best_epoch_ind'] = best_ind
+    train_results['mean_abs_logit'] = logit.apply(np.abs).mean()
+    train_results['min_abs_logit'] = logit.apply(np.abs).min()
+    if is_fail and 1:
+        visualize_adversary(dataframe,True)
     if verbose>0:
+        if is_fail:
+            print('##   Utilities:',', '.join([f'{r:.3f}' for r in train_losses]),'Best',best_ind)
+        print('##   Num switched {num_switched}, Entropy {entropy:.3f}, Mean abs logit {mean_abs_logit:.2f}, '\
+          'Min abs logit {min_abs_logit:.3f}, Entropy Coeff {entropy_coeff:.1g}'.format(**train_results))
         tl_str = ' Test Loss: {:.3f}'.format(batch_loss(test_loss,model,df_test)) if df_test is not None else ''
         tl_str += ' ({:.1f} min)'.format((time.time()-start_time)/60)
         print("Train Loss ({} Epochs): {:.3f}{}".format(epoch+1,epoch_loss_avg.result(),tl_str))
@@ -504,11 +600,59 @@ def train_model(model,dataframe,loss,learning_rate,N_epoch=20,batch_size=32,save
   #  else:
    #     dataframe.hist(column='loss', bins=100)
     #plt.show()
-    return train_loss_results
+    return train_results
 
+def visualize_adversary(df,plot_chosen=False):
+    X_all = np.vstack(df['obs'].to_numpy())
+    pca = PCA(n_components=2)
+    pca.fit(X_all)
+    df_L = df[df['is_expert']==False].sort_values(['traj_ind','t'])
+    ch_inds = (df_L['chosen']).to_numpy()
+    N = sum(ch_inds)
+    print('Chosen utility',(df_L[ch_inds]['adversary']*df_L[ch_inds]['model_prob_a'])[:N].mean(),
+          'Other utility',(df_L[~ch_inds]['adversary']*df_L[~ch_inds]['model_prob_a'])[:N].mean())
+    print('Chosen loss',df_L[ch_inds]['loss'][:N].mean(),
+          'Other loss',df_L[~ch_inds]['loss'][:N].mean())
+    plt.figure()
+    plt.hist(df_L[ch_inds]['adversary'],100,label='chosen f',range=(df_L['adversary'].min(), df_L['adversary'].max()))
+    plt.hist(df_L[~ch_inds]['adversary'],100,label='not chosen f',range=(df_L['adversary'].min(), df_L['adversary'].max()))
+    plt.legend()
+    plt.show()
+    plt.figure()
+    plt.hist(df_L[ch_inds]['loss'],100,label='chosen loss',range=(df_L['loss'].min(), df_L['loss'].max()))
+    plt.hist(df_L[~ch_inds]['loss'],100,label='not chosen loss',range=(df_L['loss'].min(), df_L['loss'].max()))
+    plt.legend()
+    plt.show()
+    E_pca = pca.transform(np.vstack(df['obs_next_ref'][df['is_expert']==True].to_numpy()))
+    L_pca = pca.transform(np.vstack(df_L['obs_next_ref'].to_numpy()))
+    #print(df_L[['obs','action_ref','obs_next_ref']][ch_inds][:N])
+    #print(df_L[['obs','action_ref','obs_next_ref']][~ch_inds][:N])
+    E_adv_f = df['adversary'][df['is_expert']==True].to_numpy()
+    L_adv_f = df_L['adversary'].to_numpy()
+    E_prob = df['model_prob_a'][df['is_expert']==True].to_numpy()
+    L_prob = df_L['model_prob_a'].to_numpy()
+    f_vals = [*E_adv_f,*L_adv_f]
+    f_mean,f_std = np.mean(f_vals),np.std(f_vals)
+    vmin,vmax = min(f_vals),max(f_vals)#f_mean-2*f_std,f_mean+2*f_std
+    cms = ['Purples','Blues','Greens','Oranges','Reds']*10
+    #plt.scatter(E_pca[:,0],E_pca[:,1],marker='o',label='E',c=E_adv_f,cmap='Greys',vmin=vmin,vmax=vmax)
+    #plt.colorbar()
+    if plot_chosen:
+        plt.scatter(L_pca[ch_inds][:N,0],L_pca[ch_inds][:N,1],marker='+',
+                    label='chosen',c=L_adv_f[ch_inds][:N],cmap='hsv',vmin=vmin,vmax=vmax)
+        plt.scatter(L_pca[~ch_inds][:N,0],L_pca[~ch_inds][:N,1],marker='x',
+                    label='not chosen',c=L_adv_f[~ch_inds][:N],cmap='hsv',vmin=vmin,vmax=vmax)
+    else:
+        for i in pd.unique(df_L['i_agg']):
+            i_inds = (df_L['i_agg']==i).to_numpy()
+            plt.scatter(L_pca[i_inds][:,0],L_pca[i_inds][:,1],marker='o',
+                        label=f'L{i}',s=L_prob[i_inds]*100,c=L_adv_f[i_inds],cmap=cms[int(i)],vmin=vmin,vmax=vmax)
+    plt.colorbar()
+    plt.legend()
+    plt.show()
 ####### Loss functions
 
-def softmax_cross_entropy(model,dataset,adversary_f=None,model_prob_a=None):
+def softmax_cross_entropy(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     #Don't apply a softmax at the final layer!! This already does that for you!!
     a = np.hstack(dataset['action'].to_numpy())
     obs = np.vstack(dataset['obs'].to_numpy())
@@ -518,32 +662,32 @@ def softmax_cross_entropy(model,dataset,adversary_f=None,model_prob_a=None):
     return tf.nn.sparse_softmax_cross_entropy_with_logits(labels=a,logits=model(obs))*w
     #tf.compat.v1.losses.sparse_softmax_cross_entropy(a,model(obs),weights=w) #This is the same as tf.nn... but with a tf.reduce_mean wrapped around
     #this is equivalent to -np.log(softmax(model(obs),axis=1))[:,a]
-def zeroone_loss(model,dataset,adversary_f=None,model_prob_a=None):
+def zeroone_loss(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     a = np.hstack(dataset['action'].to_numpy())
     obs = np.vstack(dataset['obs'].to_numpy())
     w = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     return tf.cast(tf.math.not_equal(a,tf.math.argmax(model(obs),axis=1)),tf.float32)*w
-def L2_loss(model,dataset,adversary_f=None,model_prob_a=None):
+def L2_loss(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     a = np.vstack(dataset['action'].to_numpy())
     obs = np.vstack(dataset['obs'].to_numpy())
     w = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     return tf.sqrt(tf.reduce_sum((model(obs)-a)**2,axis=1))*w
-def mse_loss(model,dataset,adversary_f=None,model_prob_a=None):
+def mse_loss(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     a = np.vstack(dataset['action'].to_numpy())
     obs = np.vstack(dataset['obs'].to_numpy())
     w = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     return tf.reduce_sum((model(obs)-a)**2,axis=1)*w
-def L1_loss(model,dataset,adversary_f=None,model_prob_a=None):
+def L1_loss(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     a = np.vstack(dataset['action'].to_numpy())
     obs = np.vstack(dataset['obs'].to_numpy())
     w = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     return tf.reduce_sum(tf.abs(model(obs)-a),axis=1)*w
-def logcosh_loss(model,dataset,adversary_f=None,model_prob_a=None):
+def logcosh_loss(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     a = np.vstack(dataset['action'].to_numpy())
     obs = np.vstack(dataset['obs'].to_numpy())
     w = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     return tf.reduce_sum(tf.log(tf.cosh(model(obs)-a)),axis=1)*w
-def FAIL_loss_old_old(model,dataset,adversary_f=None,model_prob_a=None):
+def FAIL_loss_old_old(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
 
     obs = np.vstack(dataset['obs'].to_numpy())
     w_E = tf.cast(dataset['weight'].to_numpy(),tf.float32)
@@ -557,7 +701,7 @@ def FAIL_loss_old_old(model,dataset,adversary_f=None,model_prob_a=None):
     #raise NotImplementedError()
     return FAIL#tf.reduce_mean(FAIL)
 
-def FAIL_loss_old(model,dataset,adversary_f=None,model_prob_a=None):
+def FAIL_loss_old(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     obs = np.vstack(dataset['obs'].to_numpy())
     w_E = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     #is_expert = tf.cast(dataset['is_expert'].to_numpy(),tf.float32)
@@ -585,7 +729,8 @@ def FAIL_loss_old(model,dataset,adversary_f=None,model_prob_a=None):
         raise Exception()
     return FAIL#tf.reduce_mean(FAIL)
 
-def FAIL_loss(model,dataset,adversary_f=None,model_prob_a=None):
+def FAIL_loss(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
+    w = tf.cast(dataset['weight'].to_numpy(),tf.float32)
     obs = np.vstack(dataset['obs'].to_numpy())
     a = tf.cast(np.vstack(dataset['action_ref'].to_numpy()),tf.int32)
     #adversary = tf.squeeze(tf.cast(adversary_f(np.vstack(dataset['obs_next_ref'].to_numpy())),tf.float32))/tf.cast(np.hstack(dataset['action_ref_prob'].to_numpy()),tf.float32)
@@ -593,9 +738,16 @@ def FAIL_loss(model,dataset,adversary_f=None,model_prob_a=None):
     adversary_E = tf.cast(dataset['adversary_E'].to_numpy(),tf.float32)
     #pi_action_ref_given_obs = tf.gather_nd(model_prob_a(model(obs)),a,batch_dims=1)
     pi_action_ref_given_obs = model_prob_a(model(obs),a)
-    return pi_action_ref_given_obs*adversary - adversary_E
+    entropy = -pi_action_ref_given_obs*tf.log(pi_action_ref_given_obs+1e-12)
+    entropy_coeff = 0 if entropy_coeff is None else entropy_coeff
+    loss = pi_action_ref_given_obs*adversary*w - entropy*entropy_coeff
+    nanvals = np.isnan(loss)
+    if nanvals.any():
+        print(model(obs)[nanvals],pi_action_ref_given_obs[nanvals],adversary[nanvals],w[nanvals],entropy[nanvals])
+        raise Exception()
+    return pi_action_ref_given_obs*adversary*w - entropy*entropy_coeff #- adversary_E
 
-def FAIL_loss_crossentropy(model,dataset,adversary_f=None,model_prob_a=None):
+def FAIL_loss_crossentropy(model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None):
     obs = np.vstack(dataset['obs'].to_numpy())
     a = tf.cast(np.hstack(dataset['action_ref'].to_numpy()),tf.int32)
     adversary = tf.squeeze(tf.cast(adversary_f(np.vstack(dataset['obs_next_ref'].to_numpy())),tf.float32))/tf.cast(np.hstack(dataset['action_ref_prob'].to_numpy()),tf.float32)
@@ -603,16 +755,16 @@ def FAIL_loss_crossentropy(model,dataset,adversary_f=None,model_prob_a=None):
 
 def batch_loss_old(loss,model,dataset,adversary_f=None,model_prob_a=None,batch_size=2048):
     return sum([loss(model,dataset[i:i+batch_size],adversary_f,model_prob_a).numpy()*len(dataset[i:i+batch_size]) for i in range(0,len(dataset),batch_size)])/len(dataset)
-def batch_loss(loss,model,dataset,adversary_f=None,model_prob_a=None,batch_size=2048):
-    return np.mean(np.hstack([loss(model,dataset[i:i+batch_size],adversary_f,model_prob_a).numpy() for i in range(0,len(dataset),batch_size)]))
+def batch_loss(loss,model,dataset,adversary_f=None,model_prob_a=None,entropy_coeff=None,batch_size=2048):
+    return np.mean(np.hstack([loss(model,dataset[i:i+batch_size],adversary_f,model_prob_a,entropy_coeff).numpy() for i in range(0,len(dataset),batch_size)]))
 def batch_eval(model,dataset,batch_size=2048):
     if len(dataset)<= batch_size:
         return model(dataset)
     return np.vstack([model(dataset[i:i+batch_size]).numpy() for i in range(0,len(dataset),batch_size)])
-def batch_model_prob_a(model_prob_a,model,dataset,a,batch_size=2048):
+def batch_model_func_out_a(func_out_a,model,dataset,a,batch_size=2048):
     if len(dataset)<= batch_size:
-        return model_prob_a(model(dataset),a)
-    return np.hstack([model_prob_a(model(dataset[i:i+batch_size]),a[i:i+batch_size]).numpy() for i in range(0,len(dataset),batch_size)])
+        return func_out_a(model(dataset),a)
+    return np.hstack([func_out_a(model(dataset[i:i+batch_size]),a[i:i+batch_size]).numpy() for i in range(0,len(dataset),batch_size)])
 ### Auxiliary
 
 def sample_next_obs(env,state,action,state_prev=None,action_prev=None,n_avg=1):
@@ -632,17 +784,18 @@ def compute_action_prob(df,model,model_prob_a,batch_size=2048):
 def resample_next_states(df_L,sample_env,A_dim,n_samp=1,num_new=None,verbose=0,obs_postprocess = None):
     env_id = sample_env.unwrapped.spec.id
     obs_post = (lambda obs,**kw:obs) if obs_postprocess is None else obs_postprocess
-    df_L = df_L.dropna()
+    #print('resamp pre',df_L['i_agg'].max(),len(df_L))
+    df_L = df_L.dropna(subset=['state_prev', 'state','action_prev','action'])
     num_new = num_new or len(df_L)
-    
+    #print('resamp pre',df_L['i_agg'].max(),len(df_L))
     n_samp = min(n_samp,A_dim)
     df = pd.concat([df_L[-num_new:] for n in range(n_samp)],ignore_index=True)
-    print('num_new',num_new,len(df))
+    #print('num_new',num_new,len(df))
     #print(df['action'][:10])
     #df['action_orig'] = df['action']
     #df['obs_next_orig'] = df['obs_next']
     if n_samp==A_dim:   #Try every action
-        df['action_ref'] = [i for i in range(A_dim) for j in range(len(df)//A_dim)]
+        df['action_ref'] = np.array([i for i in range(A_dim) for j in range(len(df)//A_dim)],dtype=np.int32)
     else:               #Randomly subsample actions
         df['action_ref'] = np.random.randint(A_dim,size=(len(df),1))
     #print(df['action'][:10])
@@ -661,6 +814,7 @@ def resample_next_states(df_L,sample_env,A_dim,n_samp=1,num_new=None,verbose=0,o
         print('Done forward simulating ({:.1f})'.format((time.time()-start)/60))
     df_out = pd.concat([df_L[:-num_new],df],ignore_index=True)
     df_out = df_out.dropna().reset_index(drop=True)
+    #print('resamp post',df_out['i_agg'].max())
     return df_out
 
 def setup_training_dataframe(alg,df_E,df_L=None,pi_E=None,num_new=None):
@@ -726,22 +880,46 @@ def str_to_fm_pipeline(feature_map_pipeline='linear'):
     for ind,fm in enumerate(feature_map_pipeline.split(' ')):
         name,num = fm.split('-')[0],int(fm.split('-')[1]) if '-' in fm else None
         if name == 'linear':
-            pipeline_list.append((name+str(ind), None))
+            pipeline_list.append((f'{ind}-{name}', None))
         elif name =='poly':
-            pipeline_list.append((name+str(ind), PolynomialFeatures(degree=num or 2)))
-        elif name =='standardscalar':
-            pipeline_list.append((name+str(ind), StandardScaler()))
-        elif name =='quantilescalar':
-            pipeline_list.append((name+str(ind), QuantileTransformer()))
+            deg = num or 2
+            pipeline_list.append((f'{ind}-{name}-{deg}', PolynomialFeatures(degree=deg)))
+        elif name =='meanscaler':
+            pipeline_list.append((f'{ind}-{name}', StandardScaler(with_std=False)))
+        elif name =='stdscaler':
+            pipeline_list.append((f'{ind}-{name}', StandardScaler(with_mean=False)))
+        elif name =='standardscaler':
+            pipeline_list.append((f'{ind}-{name}', StandardScaler()))
+        elif name =='quantilescaler':
+            pipeline_list.append((f'{ind}-{name}', QuantileTransformer()))
         elif name =='pca':
-            pipeline_list.append((name+str(ind), PCA(n_components=num or 100)))
+            n_comp = num or 100
+            pipeline_list.append((f'{ind}-{name}-{n_comp}', PCA(n_components=n_comp)))
         elif name =='rff':
-            pipeline_list.append((name+str(ind), RBFSampler(n_components=num or 100)))
+            n_comp = num or 100
+            pipeline_list.append((f'{ind}-{name}-{n_comp}', RBFSampler(n_components=n_comp)))
         else:
-            pipeline_list.append((name+str(ind), None))
+            pipeline_list.append((f'{ind}-{name}', None))
         #if name == 'signsplit':
         #    pipeline_list.append((name+str(ind), FunctionTransformer(lambda X: np.hstack([X*(X>0),-X*(X<0)]))))
     return pipeline_list
+
+def js_from_samples(X1, X2):
+    #X1, X2: n x d matrices
+    X1 = np.stack([x.flatten() for x in X1])
+    X2 = np.stack([x.flatten() for x in X2])
+    mean_0 = np.mean(X1, axis = 0)
+    std_0 = np.std(X1, axis = 0) + 1e-7
+    mean_1 = np.mean(X2,axis=0)
+    std_1 = np.std(X2,axis=0) + 1e-7
+
+    kl = 0.5*(np.sum(std_0/std_1) + (mean_0-mean_1).dot(np.diag(1./std_1)).dot(mean_0-mean_1)
+              - X1.shape[1] + np.log(np.sum(std_1)/np.sum(std_0)))
+
+    ikl = 0.5*(np.sum(std_1/std_0) + (mean_1 - mean_0).dot(np.diag(1./std_0)).dot(mean_1 - mean_0) 
+             - X1.shape[1] + np.log(np.sum(std_0)/np.sum(std_1)))
+
+    return (kl+ikl)/2.
 def fit_adversary(x_0,x_1,w_0=None,w_1=None,feature_map_pipeline='linear',NN_mid_as_feats=False,model=None,Obs_shape=None):
     X = np.stack([x.flatten() for x in itertools.chain(x_0,x_1)])
     N_0,N_1 = len(x_0),len(x_1)
@@ -777,14 +955,14 @@ def fit_adversary(x_0,x_1,w_0=None,w_1=None,feature_map_pipeline='linear',NN_mid
     #adversary_f = lambda X: np.mean(X,axis=1)
     return adversary_f#,w,NN_featurize
 
-def verify_adversary(N=1000,d=5):
+def verify_adversary(N=1000,d=5,feature_map_pipeline='linear'):
     ''' Running this requires you modify fit_adversary to output adversary_f,w,NN_featurize'''
     N_samp0,N_samp1 = N//2,N//2
     dim =d
-    mu0 = np.zeros((dim,))
-    mu1 = np.ones((dim,))*(dim**2)
-    mu2 = np.ones((dim,))*(dim**2)
-    mu2[1] *= -1
+    mu0 = np.ones((dim,))*5
+    mu1 = mu0+np.ones((dim,))*(dim**2)
+    mu2 = copy.copy(mu1)
+    mu2[1] = mu0[1]-(dim**2)
     sig0 = np.ones((dim,))*2*dim**.25
     sig1 = np.ones((dim,))*dim**.25
     sig2 = np.ones((dim,))*dim**.25
@@ -798,16 +976,17 @@ def verify_adversary(N=1000,d=5):
     x2 = np.random.randn(N_samp1,dim)*sig2 + mu2
     #y = np.hstack([np.zeros((N_samp0,)),np.ones((N_samp1,))])
     #X = np.vstack([x0,x1])
-    adversary_f,w,NN_featurize = fit_adversary(x0,x1,feature_map_pipeline='linear')
-    print(np.mean(adversary_f(x0)-adversary_f(x1)))
-    print(np.mean(adversary_f(x0)-adversary_f(x2)))
-    print(x0[:5],NN_featurize(x0[:5]))
-    plt.scatter(x0[:,0],x0[:,1],marker='x',label='X0 ')
-    plt.scatter(x1[:,0],x1[:,1],marker='o',label='X1')
-    plt.scatter(x2[:,0],x2[:,1],marker='o',label='X2 (diff dist)')
-    plt.plot([0,10*w[0]],[0,10*w[1]],lw=3,label='w',c='r')
+    adversary_f = fit_adversary(x0,x1,feature_map_pipeline=feature_map_pipeline)
+    print('Mean diff between train distributions', np.mean(adversary_f(x0)-adversary_f(x1)))
+    print('Mean diff against orthogonal distribution',np.mean(adversary_f(x0)-adversary_f(x2)))
+    f_vals = [*adversary_f(x0),*adversary_f(x1)]
+    cm = 'hsv'
+    vmin,vmax = min(f_vals),300#max(f_vals)
+    plt.scatter(x0[:,0],x0[:,1],marker='x',label='X0',c=adversary_f(x0),cmap=cm,vmin=vmin,vmax=vmax)
+    plt.scatter(x1[:,0],x1[:,1],marker='o',label='X1',c=adversary_f(x1),cmap=cm,vmin=vmin,vmax=vmax)
+    plt.scatter(x2[:,0],x2[:,1],marker='+',label='X2 (diff dist)',c=adversary_f(x2),cmap=cm,vmin=vmin,vmax=vmax)
+    plt.colorbar()
     plt.legend()
-    print(w)
     plt.show()
 
 def save_pkl_to_df(path):
@@ -845,6 +1024,24 @@ def load_agg_save(path,results_list=[]):
     results_df.to_csv(path,index=False)
     return results_df
 
+def load_agg_save_safe2(path,results_list=[]):
+    '''loads df (if exists), appends df in results_list, saves and returns combined df'''
+    results_list = [results_list] if type(results_list) is not list else results_list #idiot proof
+    with open(path,'a+') as f:
+        portalocker.lock(f,portalocker.LOCK_EX)
+        if len(results_list)>0:
+            results_df = pd.concat(results_list,ignore_index=True)
+            results_df.to_csv(f,index=False,header=f.tell()==0) #Adds header only to first line
+    return pd.read_csv(path)
+def load_agg_save_safe(path,results_list=[]):
+    '''loads df (if exists), appends df in results_list, saves and returns combined df'''
+    results_list = [results_list] if type(results_list) is not list else results_list #idiot proof
+    if len(results_list)>0:
+        with portalocker.Lock(path) as f:
+            results_df = pd.concat(results_list,ignore_index=True)
+            results_df.to_csv(f,index=False,header=f.tell()==0) #Adds header only to first line
+    return pd.read_csv(path)
+
 def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
     '''
     Averages accross all columns not specified in constants
@@ -855,6 +1052,8 @@ def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
     filters - dict where key is attribute and value is list of permissible
     
     '''
+    if type(df) is str:
+        df = load_agg_save_safe(df)
     #Set Default Plot Attributes
     CI_style = plotattrs.setdefault('CI_style','polygon') #Confidence interval style 'polygon' or 'errorbar'
     colormap = plotattrs.setdefault('colormap','tab10')
@@ -867,26 +1066,27 @@ def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
     legend_on = plotattrs.setdefault('legend_on',True)
     ylabel_on = plotattrs.setdefault('ylabel_on',True)
     save_dir = plotattrs.setdefault('save_dir',None)
-    env_id = plotattrs.setdefault('env_id','')
+    env_id = plotattrs.setdefault('env_id',df['env_id'][0])
     exp_name = plotattrs.setdefault('exp_name','')
     legend = plotattrs.setdefault('legend',None)
 
     #Make sure filter values are lists, even if they only have one item
-    filters = {k:([filters[k]] if type(filters[k]) is not list else filters[k]) for k in filters}
+    filters = {k:([filters[k]] if type(filters[k]) is not list else filters[k]) for k in filters} if filters is not None else None
 
     # Gather lines and filter for desired attrs
-    lines_df = df[lines].drop_duplicates().dropna() if type(lines) in [list,str] else lines
+    lines = [lines] if type(lines) is str else lines
+    lines_df = df[lines].drop_duplicates().dropna() if type(lines) is list else lines
     if not incl_exp:
         lines_df = lines_df[~(lines_df['alg'].isin(['Expert']))]
     if not incl_rand:
         lines_df = lines_df[~(lines_df['alg'].isin(['Random']))]
-    lines_df = lines_df.sort_values('alg')
+    lines_df = lines_df.sort_values(lines)
     if filters is not None:
         df = df[(df[filters.keys()].isin(filters)).all(axis=1) | (df['alg'].isin(['Expert']) & incl_exp) | (df['alg'].isin(['Random']) & incl_rand)]
 
     #Set colormap, linestyles,axis labels, legend label formats, title
     if colormap in DISCRETE_COLORMAPS:
-        cs = plt.cm.get_cmap(colormap).colors #Discrete colormaps
+        cs = [c for c in plt.cm.get_cmap(colormap).colors]*2 #Discrete colormaps
     else: #Contiuous colormaps
         cs = [plt.cm.get_cmap(colormap)(val) for val in np.linspace(1,0,len(lines_df))] 
     lss = [ls for i in range(len(lines_df)) for ls in linestyles]
@@ -897,7 +1097,9 @@ def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
               'loss_test':'Validation Loss',
               'w_ESS':'Effective Sample Size'}.get(yaxis,yaxis)
     leg_format = lambda col: {'total_opt_steps':'{:.2g}'}.get(col,'{}')
-    leg_label = lambda col: {'total_opt_steps':'# opt'}.get(col,col)
+    leg_label = lambda col: {'total_opt_steps':'# opt','entropy_coeff':'w_H','drop_first':'drop',
+                             'model_reg_coeff':'reg','learning_rate':'lr','horizon_weight_offset_exp':'hwoe',
+                             'recent_samp_priority_exp':'pe'}.get(col,col)
 
     title = plotattrs.setdefault('title',' '.join([env_id,exp_name,ylabel]))
 
@@ -905,7 +1107,6 @@ def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
     figname = '-'.join([env_id,exp_name,xaxis,yaxis])
     plt.figure(figname)
     lines_df = pd.DataFrame(lines_df).reset_index(drop=True) #Handle single line
-    print(lines_df)
     for i,line in lines_df.iterrows():
         label = ', '.join([leg_label(k)+' = '+leg_format(k).format(v) if k!='alg' else v for k,v in line.items()])
         label = line['alg'] if line['alg'] in ['Expert','Random'] else label
@@ -938,23 +1139,49 @@ def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
     if save_dir is not None:
         plt.savefig(os.path.join(save_dir,figname))
 
+
+def argsparser():
+    parser = argparse.ArgumentParser("Implementations of ALICE alg and IL baselines")
+    parser.add_argument('alg', help='IL algorithm to run', default='BC', choices=['BC','DaD','ALICE-Cov','ALICE-FAIL','ALICE-Cov-FAIL','Expert','Random','DAgger'])
+    parser.add_argument('--env_id', help='environment ID', default='CartPole-v1',required=True)
+    parser.add_argument('--seed', help='RNG seed', type=int, default=0)
+    parser.add_argument('--expert_path', type=str, default='CartPole-v1expert_traj_linear_deterministic.p')
+    parser.add_argument('--policy_hidden_size', type=int, default=64)
+    parser.add_argument('--num_hid_layers', help='number of hidden layer in policy: default zero, i.e., linear policy', type=int, default=2)
+    parser.add_argument('--task', type=str, choices=['train', 'evaluate', 'sample'], default='train')
+    parser.add_argument('--num_timesteps', help='total number of samples', type=int, default=1e6)
+    parser.add_argument('--min_max_game_iteration', help='number of iterations in each min-max game', type = int, default = 500)
+    parser.add_argument('--num_roll_in', help="num of roll ins in online train model", type=int,default=100)
+    parser.add_argument('--adam_lr', help='learning rate in adam', type=float, default=1e-2)
+    parser.add_argument('--l2_lambda',help='l2 regularization lambda', type=float, default=1e-7)
+    parser.add_argument('--horizon', help='horizon of episode, num of policies should be horizon - 1', type=int, default = 100)
+    parser.add_argument('--num_expert_trajs', help='number of expert trajectories', type=int, default=500)
+    parser.add_argument('--warm_start', help='initlize pi with the previous trained one', type=int, default=0)
+    parser.add_argument('--mixing',help='mixing the previous policy with uniform policy for pi_ref', type=int,default=0)
+
+    return parser.parse_args()
+
 def alg_runner(alg,env_id,**kwargs):
     
     #useful booleans
     is_atari = env_id in ATARI_ENVS
     is_cov =  alg in ['ALICE-Cov','ALICE-Cov-FAIL']
     is_fail = alg in ['ALICE-FAIL','ALICE-Cov-FAIL']
+    is_alice = is_cov or is_fail
     is_mujoco = env_id in MUJOCO_ENVS
 
     ### Play with these
     N_E_traj = kwargs.setdefault('N_E_traj',10) #Number of expert trajectories to use as test data
+    N_ALICE_traj = kwargs.setdefault('N_ALICE_traj',N_E_traj)
     N_agg_iter = kwargs.setdefault('N_agg_iter',10 if alg not in ['Expert','Random'] else 1)
     N_epoch = kwargs.setdefault('N_epoch',5) #Number of training epochs
     opt_steps_per_iter = kwargs.setdefault('total_opt_steps',500000)//N_agg_iter
     add_history = kwargs.setdefault('add_history',False)
     kill_feats = kwargs.setdefault('kill_feats',None)
+    if kill_feats is not None:
+        kill_feats = kwargs['kill_feats'] = tuple(kill_feats) if type(kill_feats) in [list,tuple] else (kill_feats,)
     verbose = kwargs.setdefault('verbose',0)
-    pair_E_s0 = kwargs.setdefault('pair_E_s0',True if alg in ['DaD'] else False)
+    
     run_seed = kwargs.setdefault('run_seed',None)
     opt_seed = kwargs.setdefault('opt_seed',None) #If you are initializing from scratch, this is the weight initializer seed, otherwise this is just batch shuffle seed
     
@@ -964,7 +1191,10 @@ def alg_runner(alg,env_id,**kwargs):
     ### Probably don't play with these
     learning_rate = kwargs.setdefault('learning_rate',0.01)
     learning_rate_BC = kwargs.setdefault('learning_rate_BC',learning_rate)
-    H_dims = kwargs.setdefault('H_dims',[512] if not is_atari else None)
+    entropy_coeff = kwargs.setdefault('entropy_coeff',None)                     
+    H_dims = kwargs.setdefault('H_dims',(512,) if not is_atari else None)
+    if H_dims is not None:
+        H_dims = kwargs['H_dims'] = tuple(H_dims) if type(H_dims) in [list,tuple] else (H_dims,)
     linear = kwargs.setdefault('linear',False)
     N_test_E_traj = kwargs.setdefault('N_test_E_traj',50)                       #Test dataset size
     N_test_rollout = kwargs.setdefault('N_test_rollout',50)                     #N trajs for final rollout
@@ -985,11 +1215,16 @@ def alg_runner(alg,env_id,**kwargs):
     model_reg_coeff = kwargs.setdefault('model_reg_coeff',None)                 #amount of regularization to apply to each of 
     partial_obs = kwargs.setdefault('partial_obs',False)
     results_path = kwargs.setdefault('results_path',None)
-  
+    recent_samp_priority_exp = kwargs.setdefault('recent_samp_priority_exp',1)
+    horizon_weight_offset_exp = kwargs.setdefault('horizon_weight_offset_exp',None)
+    pair_with_E = kwargs.setdefault('pair_with_E',True if (alg in ['DaD']) or (horizon_weight_offset_exp is not None) else False)
+    drop_first = kwargs.setdefault('drop_first',0)
 
     if partial_obs:
-        kill_feats = {'CartPole-v1':[1,3],'Acrobot-v1':[4,5],'MountainCar-v0':[1],
-                      'Reacher-v2':[],'Hopper-v2':[],'HalfCheetah-v2':[],'Walker2d-v2':[],'Humanoid-v2':[],'Ant-v2':[]}[env_id]
+        kill_feats = {'CartPole-v1':(3),'Acrobot-v1':(4,5),'MountainCar-v0':(1),
+                      'Reacher-v2':(),'Hopper-v2':(),'HalfCheetah-v2':(),'Walker2d-v2':(),'Humanoid-v2':(),'Ant-v2':()}.get(env_id,())
+    max_len = {'CartPole-v1':500,'Reacher-v2':1000,'Hopper-v2':1000,'HalfCheetah-v2':1000,'Walker2d-v2':1000,'Humanoid-v2':1000,'Ant-v2':1000,
+               'MountainCar-v0':200,'Acrobot-v1':200}.get(env_id,100000)
 
 
     #Get expert, train and test set
@@ -1006,6 +1241,7 @@ def alg_runner(alg,env_id,**kwargs):
     sample_env = make_env(env_id) #for sampling next states
     DISCRETE = hasattr(sample_env.action_space,'n')
     loss_function = kwargs.setdefault('loss_function','mse' if not DISCRETE else None)
+    #max_len = df_E['t'].max()
 
     #Obs_shape,A_dim = learner_pre(sample_env.reset(),env_id=env_id)[0].shape, sample_env.action_space.n
     A_dim = sample_env.action_space.n if DISCRETE else sample_env.action_space.shape[0]
@@ -1042,10 +1278,11 @@ def alg_runner(alg,env_id,**kwargs):
 
     Obs_shape = df_E['obs'][0].shape[1:] if (alg=='Expert' or is_atari) else add_batch_dim(df_E['obs'][0]).shape[1:]
     _keras_NN = partial(keras_NN,Obs_shape=Obs_shape,A_dim=A_dim,cnn=is_atari,linear=linear,seed=opt_seed,H_dims=H_dims,model_reg_coeff=model_reg_coeff,clip_range=clip_range)
-    _train_model = partial(train_model,verbose=verbose-1,N_epoch=N_epoch,batch_size=batch_size,steps_per_epoch=int(opt_steps_per_iter/N_epoch),seed=opt_seed,learning_rate=learning_rate,df_test=df_test,test_loss=test_loss,model_prob_a=model_prob_a)
-    _get_trajectories = partial(get_trajectories,env_id=env_id,N_traj=N_E_traj,obs_preprocess=learner_pre,obs_postprocess=learner_pre,pair_with_E=pair_E_s0,seed=run_seed,verbose=verbose-1,
-expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render,T_max=T_max)
-    
+    _train_model = partial(train_model,verbose=verbose-1,N_epoch=N_epoch,batch_size=batch_size,steps_per_epoch=int(opt_steps_per_iter/N_epoch),seed=opt_seed,learning_rate=learning_rate,df_test=df_test,test_loss=test_loss,model_prob_a=model_prob_a,entropy_coeff=entropy_coeff)
+    _get_trajectories = partial(get_trajectories,env_id=env_id,N_traj=N_ALICE_traj,obs_preprocess=learner_pre,obs_postprocess=learner_pre,pair_with_E=pair_with_E,
+                                verbose=verbose-1,expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render,T_max=T_max,
+                                randinit_t=horizon_weight_offset_exp is not None,choose_random_expert=(N_ALICE_traj!=N_E_traj))
+    _eval_pi_lightweight = partial(eval_pi_lightweight,env_id=env_id,N_traj=N_test_rollout,run_seed=run_seed,obs_preprocess=learner_pre,verbose=verbose-1)
 
 
     start_time = time.time()
@@ -1056,12 +1293,15 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
     model_list,weights_E_list = [_keras_NN()],[np.ones((len(df_E)))]
     df_train,adversary_f,df_L = df_E,None,None
     epoch_train_losses = []
+    df_E['i_agg'] = np.zeros(len(df_E))
 
     if alg in ['BC','DaD','ALICE-Cov','ALICE-FAIL','ALICE-Cov-FAIL','Expert-FAIL']:
 
         #Initialize first policy by training BC
-        epoch_train_losses.extend(_train_model(model_list[-1],df_E,test_loss,learning_rate=learning_rate_BC))
-
+        train_results = _train_model(model_list[-1],df_E,test_loss,learning_rate=learning_rate_BC)
+        epoch_train_losses.extend(train_results['epoch_losses'])
+        results_dicts[0].update(train_results)
+        
         #Begin iterations
         for i_agg in range(1,N_agg_iter):
             if verbose>1:
@@ -1071,25 +1311,36 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
             if alg not in ['Expert-FAIL']:
                 pi_i = lambda obs: np.squeeze(np.argmax(model_list[-1](obs),axis=-1)) if DISCRETE else np.squeeze(model_list[-1](obs))
                 N_L_prev = len(df_L) if df_L is not None else 0
-                #print('df_L pre gen',N_L_prev)
-                df_L = _get_trajectories(pi_i,df_agg=df_L,df_E=df_E)
+                print('df_L pre gen',N_L_prev)
+                horizon = max_len if horizon_weight_offset_exp is None else min(int(horizon_weight_offset_exp[0]*(i_agg**horizon_weight_offset_exp[2]) + horizon_weight_offset_exp[1]),max_len)
+                df_L = _get_trajectories(pi_i,df_agg=df_L,df_E=df_E,horizon=horizon,seed=run_seed+1000*i_agg)
+                df_L.loc[np.arange(N_L_prev,len(df_L)),'i_agg'] = np.ones(len(df_L)-N_L_prev)*i_agg
+                
+                df_L = df_L[df_L['t']>=drop_first]
+                
                 if is_fail:
                     df_L.dropna()
-                #print('df_L post gen',len(df_L),'num_new',len(df_L)-N_L_prev)
+                
+                print('df_L post gen',len(df_L),'num_new',len(df_L)-N_L_prev,'horizon',horizon)
 
             ### Save intermediate results
-            rewards = [np.sum(df_L[N_L_prev:][df_L['traj_ind']==i]['rew'].to_numpy()) for i in range(N_E_traj)]
-            reward,reward_std = np.mean(rewards),np.std(rewards)
+            if horizon_weight_offset_exp is not None:
+                reward,reward_std = _eval_pi_lightweight(pi_i,N_traj=10)
+            else:
+                rewards = [np.sum(df_L[N_L_prev:][df_L['traj_ind']==i]['rew'].to_numpy()) for i in pd.unique(df_L[N_L_prev:]['traj_ind'])]
+                print(rewards)
+                reward,reward_std = np.mean(rewards),np.std(rewards)
+            print('rew/std',reward,reward_std)
             #hindsight_losses = [batch_loss(train_loss,model,df_train,adversary_f) for model in model_list]
             #best_ind = np.argmin(hindsight_losses) if alg != 'BC' else -1
-            results_dicts[i_agg-1].update({'w_max':df_E['weight'].max(), 'w_min':df_E['weight'].min(), 'final':False,
+            results_dicts[i_agg-1].update({'w_max':df_E['weight'].max(), 'w_min':df_E['weight'].min(), 'final':False, 'iteration_num':i_agg-1,'horizon':horizon,
                                           'w_ESS':np.linalg.norm(df_E['weight'].to_numpy(),ord=1)**2/np.linalg.norm(df_E['weight'].to_numpy(),ord=2)**2,
                                           'reward':reward,'reward_std':reward_std, 'total_opt_steps':opt_steps_per_iter*i_agg,
                                           'loss_test':batch_loss(test_loss,model_list[-1],df_test,adversary_f,model_prob_a),
-                                          'loss_train':batch_loss(train_loss if i_agg>1 else test_loss,model_list[-1],df_train,adversary_f,model_prob_a),
+                                          'loss_train':batch_loss(train_loss if i_agg>1 else test_loss,model_list[-1],df_train,adversary_f,model_prob_a,entropy_coeff),
                                           'class_test':batch_loss(classification_loss,model_list[-1],df_test,adversary_f,model_prob_a),
-                                          'runtime':(time.time()-start_time)/60,'best_ind':i_agg-1})
-                
+                                          'runtime':(time.time()-start_time)/60,'best_ind':i_agg-1,'JS_div':js_from_samples(df_L['obs_next'].values,df_E['obs_next'].values)})
+            #print(df_L['i_agg'].values)
             if is_fail:
                 df_L = resample_next_states(df_L,sample_env,A_dim,n_samp=N_FAIL_samps,num_new=len(df_L)-N_L_prev,verbose=verbose-1,obs_postprocess=learner_pre)
             if alg in ['Expert-FAIL'] and i_agg==1:
@@ -1103,11 +1354,16 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
                 df_E['weight'] = w_E = np.mean(weights_E_list,axis=0)
                 if verbose >1:
                     print('Weights - max {:.1f}, min {:.1f}, effective sample size {:d} ({:d})'.format(max(w_E),min(w_E),int(np.linalg.norm(w_E,ord=1)**2/np.linalg.norm(w_E,ord=2)**2),len(w_E)))
-
+            #Reweigh learner
+            if is_fail:
+                #print(df_L['i_agg'].values,np.power(recent_samp_priority_exp,i_agg-df_L['i_agg'].values))
+                df_L['weight'] = np.power(recent_samp_priority_exp,i_agg-df_L['i_agg'].values)
+                if verbose>1:
+                    print('min_weight',df_L['weight'].min(),'max_weight',df_L['weight'].max())
 
             #Fit adversary function
             if alg in ['ALICE-FAIL','ALICE-Cov-FAIL','Expert-FAIL']:
-                recompute_adversary = lambda model: fit_adversary(df_L['obs_next_ref'].values,df_E['obs_next'].values,compute_action_prob(df_L,model,model_prob_a)/df_L['action_ref_prob'].to_numpy(),df_E['weight'].values,adversary_feature_map,NN_mid_as_feats,model,Obs_shape)
+                recompute_adversary = lambda model: fit_adversary(df_L['obs_next_ref'].values,df_E['obs_next'].values,df_L['weight'].values*compute_action_prob(df_L,model,model_prob_a)/df_L['action_ref_prob'].to_numpy(),df_E['weight'].values,adversary_feature_map,NN_mid_as_feats,model,Obs_shape)
                 adversary_f = recompute_adversary(model_list[-1])
                 
             else:
@@ -1116,11 +1372,14 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
             
             df_train = setup_training_dataframe(alg,df_E,df_L)
             #print('df_E',len(df_E),'df_L',len(df_L) if df_L is not None else 0,'df_train',len(df_train))
+            
             ### Train
             new_model = _keras_NN() if reinit_opt else clone_model_and_weights(model_list[-1])
-            epoch_train_losses.extend(_train_model(new_model,df_train,train_loss,adversary_f=adversary_f,recompute_adversary=recompute_adversary))
+            train_results = _train_model(new_model,df_train,train_loss,adversary_f=adversary_f,recompute_adversary=recompute_adversary)
+            results_dicts[i_agg].update(train_results)
+            epoch_train_losses.extend(train_results['epoch_losses'])
             model_list.append(new_model)
-            print(df_train['loss'].min(),df_train['loss'].max(),df_train['loss'].mean())
+            #print(df_train['loss'].min(),df_train['loss'].max(),df_train['loss'].mean())
 
     if alg == 'Expert':
         model_list[0] = lambda obs: model_E.proba_step(np.reshape(obs,(-1,*Obs_shape))) if DISCRETE else model_E.predict(np.reshape(obs,(-1,*Obs_shape)))
@@ -1131,7 +1390,7 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
     if alg == 'DAgger':
         raise NotImplementedError()
 
-    if verbose>0:
+    if 0 and (verbose>0):
         print('Epoch Losses: '+' '.join([f'{loss:.2g}' for loss in epoch_train_losses]))
     #df_train.sort_values('E_ind',inplace=True)
     #printlist = ['action','loss'] if alg in ['BC'] else ['action_orig','action','loss','sp_dist','E_ind',]
@@ -1140,9 +1399,11 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
     #print(df_train[printlist][-20:])
 
     #Choose the best model in the list
-    hindsight_losses = [batch_loss(train_loss,model,df_train,adversary_f,model_prob_a) for model in model_list]
+    hindsight_losses = [batch_loss(train_loss,model,df_train,adversary_f,model_prob_a,entropy_coeff) for model in model_list]
+    for i in range(len(results_dicts)):
+        results_dicts[i]['hindsight_loss_train'] = hindsight_losses[i]
     best_ind = np.argmin(hindsight_losses) if alg != 'BC' else len(model_list)-1
-    #print(hindsight_losses)
+    print('Hindsight Losses:',', '.join([f'{L:.2f}' for L in hindsight_losses]))
     
     #Score
     test_loss_val = batch_loss(test_loss,model_list[best_ind],df_test,adversary_f,model_prob_a)
@@ -1155,10 +1416,10 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
     reward,reward_std = np.mean(rewards),np.std(rewards)
     print('{} {} {}   pi_{} train:{:.5f} test:{:.5f} reward:{:.1f} ({:.1f} m)'.format(env_id,N_E_traj,alg+Hstr,best_ind,hindsight_losses[best_ind],test_loss_val,reward,(time.time()-start_time)/60))
 
-    results_dicts[-1].update({'w_max':df_E['weight'].max(), 'w_min':df_E['weight'].min(),
+    results_dicts[-1].update({'w_max':df_E['weight'].max(), 'w_min':df_E['weight'].min(), 'final':True, 'iteration_num':i_agg,'horizon':max_len,
                               'w_ESS':np.linalg.norm(df_E['weight'].to_numpy(),ord=1)**2/np.linalg.norm(df_E['weight'].to_numpy(),ord=2)**2,
                               'reward':reward, 'reward_std':reward_std,'loss_test':test_loss_val,
-                              'loss_train':hindsight_losses[best_ind], 'final':True,
+                              'loss_train':hindsight_losses[best_ind],'JS_div':js_from_samples(df_L['obs_next'].values,df_E['obs_next'].values),
                               'class_test':batch_loss(classification_loss,model_list[best_ind],df_test,adversary_f,model_prob_a),
                               'runtime':(time.time()-start_time)/60,'best_ind':best_ind})
     sample_env.close()
@@ -1167,154 +1428,6 @@ expert_after_n=switch_2_E_after,policy_e=pi_E,e_prepro=learner_pre,render=render
     if results_path is not None:
         load_agg_save(results_path,results_df)
     return results_df
-
-if __name__=='__main__':
-    env_id = ['CartPole-v1','BeamRiderNoFrameskip-v4','BreakoutNoFrameskip-v4','EnduroNoFrameskip-v4','PongNoFrameskip-v4','QbertNoFrameskip-v4','SeaquestNoFrameskip-v4','SpaceInvadersNoFrameskip-v4','MsPacmanNoFrameskip-v4','BipedalWalker-v2','LunarLander-v2','LunarLanderContinuous-v2','BipedalWalkerHardcore-v2'][0]
-    algo = ['A2C','ACER','ACKTR','PPO2','DQN'][4]
-    algo = algo.lower()
-
-    #print('Action space shape',action_dim(env.action_space))
-
-    env_id = ['CartPole-v1','Acrobot-v1','PongNoFrameskip-v4','QbertNoFrameskip-v4','BreakoutNoFrameskip-v4','SpaceInvadersNoFrameskip-v4',][2]
-    N_traj = 10
-    experiment_name = 'exp0'
-    results_path = 'results-'+env_id+'--'+experiment_name+'.csv'
-    #options...
-    #   Train pong for less time
-    #   Train an atari agent for longer
-    #   
-    if 0:
-        model_E = get_expert_model(env_id)#,algo='a2c')
-        pi_E = lambda obs: model_E.predict(obs)[0] #None
-        traj_df = get_trajectories(pi_E,env_id,N_traj=1,path=None,render=True,verbose=2,gif_path='deepq_expert.gif',T_max=None)
-    if 0:
-        Obs_shape,A_dim = np.squeeze(traj_df['obs'].loc[0]).shape,make_env(env_id).action_space.n
-        L_model_path = env_id+'-BC_{}_model_weights.h5'.format(N_traj)
-        L_model = keras_NN(Obs_shape,A_dim,cnn=(env_id in ATARI_ENVS))
-        if os.path.exists(L_model_path):
-            load_status = L_model.load_weights(L_model_path)
-        start = time.time()
-        #train_model(L_model,traj_df,BC_loss,0.0001,verbose=1,N_epoch=20,batch_size=128,steps_per_epoch=50000)
-        print('Finished in {:.1f} min'.format((time.time()-start)/60))
-        #L_model.save_weights(L_model_path)
-        env = make_env(env_id)
-        obs = env.reset()
-        policy_L = lambda obs: np.argmax(L_model(obs),axis=-1)
-        print(L_model(obs),policy_L(obs))
-        #get_trajectories(policy_L,env_id,N_traj=10,verbose=2,render=True)
-    if 0:
-        verify_adversary(d=2)
-    if 0:
-        #alg_runner('DaD',env_id,verbose=3,total_opt_steps=1000000,N_epoch=20,resume_BC=False,N_agg_iter=10,N_E_traj=10)
-        #alg_runner('BC',env_id,verbose=3,total_opt_steps=1000000,N_epoch=20,resume_BC=False,N_E_traj=1)
-        df = alg_runner('Expert-FAIL',env_id,verbose=5,total_opt_steps=10000000,N_epoch=4,resume_BC=False,N_E_traj=2,density_ratio_feature_map='poly-1', adversary_feature_map='rff-2048 rff-512',add_history=False,pi0_BC_init=False,N_agg_iter=10,opt_seed=0,run_seed=0,linear=True,kill_feats=None,learning_rate=0.0001,NN_mid_as_feats=True,N_FAIL_samps=3)
-        print(df)
-    if 0:
-        #alg_runner('DaD',env_id,verbose=3,total_opt_steps=1000000,N_epoch=20,resume_BC=False,N_agg_iter=10,N_E_traj=10)
-        #alg_runner('BC',env_id,verbose=3,total_opt_steps=1000000,N_epoch=20,resume_BC=False,N_E_traj=1)
-        df = alg_runner('Expert-FAIL','Acrobot-v1',verbose=5,total_opt_steps=1000000,N_epoch=4,resume_BC=False,N_E_traj=2,density_ratio_feature_map='poly-1', adversary_feature_map='rff-512',add_history=False,pi0_BC_init=False,N_agg_iter=5,opt_seed=0,run_seed=0,linear=True,kill_feats=None,learning_rate=0.1,NN_mid_as_feats=False,N_FAIL_samps=3)
-        print(df)
-    if 0:
-        save_pkl_to_df('IL_experts/'+env_id+'_demo_trajs.pkl')    
-        save_pkl_to_df('IL_experts/'+env_id+'_validation_trajs.pkl')
-
-    if 0:
-
-        results_list = []
-        for i in range(10):
-          for j in range(2):
-            results_list.append(alg_runner('BC',env_id,verbose=0,total_opt_steps=600000,N_epoch=3,resume_BC=False,N_E_traj=i+1,density_ratio_feature_map='poly-1', adversary_feature_map='poly-2',add_history=True,pi0_BC_init=False,N_agg_iter=5,opt_seed=None,run_seed=None,linear=True,kill_feats=None))
-            #results_list.append(alg_runner('BC',env_id,verbose=0,total_opt_steps=600000,N_epoch=3,resume_BC=False,N_E_traj=i+1,density_ratio_feature_map='poly-1', adversary_feature_map='poly-2',add_history=False,pi0_BC_init=False,N_agg_iter=5,opt_seed=None,run_seed=None,linear=True,kill_feats=[5]))
-        results_df = load_agg_save(results_path,results_list)
-        #results_df = pd.concat(results_list,ignore_index=True)
-        plot_results(results_df,'N_E_traj','reward','alg',filters=None,env_id =env_id,experiment_name=experiment_name)
-        plot_results(results_df,'N_E_traj','loss_train',['alg'],filters=None,env_id=env_id,experiment_name=experiment_name)
-        plot_results(results_df,'N_E_traj','loss_test',['alg'],filters=None,env_id=env_id,experiment_name=experiment_name)
-        plt.show()
-    if 0:
-        #Test adding history
-        env = make_env(env_id)
-        obs = env.reset()
-        for i in range(200):
-            obs = env.step([np.random.randint(env.action_space.n)])[0]
-        obs = add_history_to_pixels(obs,0,env_id)
-        plt.imshow(np.squeeze(de_framestack(obs)))
-        plt.show()
-    if 0:
-        #df_E = get_trajectories(None,env_id,N_traj=N_traj,path='cached_experts/'+env_id+'-train.pkl.xz',T_max=4000)
-        #obs = df_E['obs'][400]
-        #plt.imshow(obs[0,:,:,0])
-        #plt.show()
-        env = make_env(env_id)
-        env.reset()
-        for i in range(500):
-            action = np.random.randint(6)
-            obs = env.step(action)[0]
-        plt.imshow(np.squeeze(obs))
-        plt.show()
-    if 1:
-        X = tf.cast(np.random.rand(5,2),tf.float32)
-        model = lambda x : X
-        model_prob_a = lambda model_out,a: tf.gather_nd(tf.nn.softmax(model_out,axis=-1),a,batch_dims=1)
-        a = [[0],[1],[1],[0],[1]]
-        print(X,a,tf.nn.softmax(X,axis=-1))
-        print(batch_model_prob_a(model_prob_a,model,X,a,batch_size=2))
-
-    if 0:
-        #Test reset
-        df_E = get_trajectories(None,env_id,N_traj=N_traj,path='cached_experts/'+env_id+'-train.pkl.xz',T_max=4000)
-        Obs_shape,A_dim = df_E['obs'].loc[0][0].shape,make_env(env_id).action_space.n
-        #make_session() #
-        #model_E = get_expert_model(env_id)
-        #model_L = keras_NN(Obs_shape,A_dim,cnn=True)
-        #model_L.load_weights('cached_experts/PongNoFrameskip-v4-BC_10_model_weights_toogood.h5')
-        #pi_L = lambda obs: np.argmax(model_L(obs),axis=-1)
-        env = make_env(env_id)
-        obs = reset_env(env)
-        action_prev,env_state = None,None
-        for i in range(200):
-            #obs = env.step(pi_L(add_batch_dim(obs)))[0]
-            action = np.random.randint(6)
-            obs_next, rew, done, _ = env.step(action)
-            env_state_next = get_state(env)
-            #Save point
-            if i == 198:
-                break
-            env_state,obs,action_prev,env_state_prev = env_state_next,obs_next,action,env_state
-
-        plt.imshow(np.squeeze(obs))
-        obs_r = reset_env(env)
-        env.step(0)
-        for i in range(10):
-            env.step(0)
-        obs_r = env.step(0)[0]
-        
-        plt.figure(); plt.imshow(np.squeeze(obs_r))
-        obs_rs = reset_env(env,None,env_state_prev,action_prev)
-        plt.figure(); plt.imshow(np.squeeze(obs_rs))
-        plt.figure(); plt.imshow(np.squeeze(obs_rs-obs))
-
-        plt.show()
-
-    if 0:
-        results_file
-
-    #Pong
-    #N_E    #training     train_loss    test loss  reward  time_elapsed
-    #10     1000000         .364         .405       -10.6       
-
-    #ALICE Acrobot was a bit of a fluke. 
-    #2 issues
-    #BC v BC+H try out DhHann's doesn't actually create issues
-    # Look in the literature for all the examples where +H supposedly create issues
-    # Try to actually tear down every place where the claim that BC or BC+H doesn't work
-        #Need to augment the set of reproducible problems
     
-    # Sanjiban 
-    # 1) Track the number of misclassified samples - track on-policy validation accuracy
-    # Why does the reward look so good 
-    # Adding history is not bad. It a
-    # How to test it's overfitting to the exceptions vs generalizing to the exceptions:
-    # For all features you map back to the same action.
-    # Adding more features should help me do better. Prove me wrong.
-
+if __name__=='__main__':
+    pass

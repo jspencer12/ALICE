@@ -10,6 +10,7 @@ cloudpickle~=1.2.0
 opencv-python==4.2.0.34
 gym[atari]
 sklearn
+portalocker
 #-e git+https://github.com/openai/baselines#egg=baselines
 # Set up stable baselines
 stable-baselines[tests,docs]>=2.10.0
