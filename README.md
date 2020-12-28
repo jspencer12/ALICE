@@ -67,16 +67,23 @@ pip install opencv-python==4.3.0.36
 
 
 ## Run the script!
+
+Every time you open up the terminal, do the following:
 ```
-python ALICE.py
+cd ALICE
+. venv_ALICE/bin/activate
+python simple_test.py
 ```
+
+@Sanjiban, try running `generate_results_dec2020.py` and looking at the csv files in `results_dec2020` 
+The plotter script takes either a DataFrame or a path as its argument.
 
 ### FYI
 All this code is written with eager execution. If you train and load an expert through rl_baselines_zoo, that's not a problem, but if you train the expert with stablebaselines, that might be a challenge, and you might need to run the expert once to generate the cached demo trajs, and then another separate session to run IL on those cached demos.
 
 The gym-CIL folder has the LQR environment, which you can try playing with if you want.
 I haven't gotten it integrated yet since it's a continuous action space, but I'll get there soon. To install it:
-cd gym-CIL && python -m pip install -e .
+`cd gym-CIL && python -m pip install -e .`
 
 ### For WSL:
 Install VcXsrv

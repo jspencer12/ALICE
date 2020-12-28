@@ -22,3 +22,4 @@ optuna
 pytablewriter
 seaborn
 pyyaml>=5.1
+densratio

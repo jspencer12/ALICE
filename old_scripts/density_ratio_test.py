@@ -6,6 +6,7 @@ from sklearn.decomposition import PCA
 from sklearn.kernel_approximation import RBFSampler
 import matplotlib.pyplot as plt
 import itertools
+from densratio import densratio
 
 EPS = 1e-12
 
@@ -27,6 +28,7 @@ def estimate_ratio_on_samps(x_0,x_1,feature_map_pipeline='',warm_start=False):
     N_0,N_1 = len(x_0),len(x_1)
     y = np.hstack([np.zeros((N_0,)),np.ones((N_1,))])
     pipeline_list = []
+    RuLSIF = False
     for fm in feature_map_pipeline.split(' '):
         name,num = fm.split('-')[0],int(fm.split('-')[1]) if '-' in fm else None
         if name == 'linear':
@@ -41,17 +43,27 @@ def estimate_ratio_on_samps(x_0,x_1,feature_map_pipeline='',warm_start=False):
             pipeline_list.append((name, PCA(n_components=num or 100)))
         if name =='rff':
             pipeline_list.append((name, RBFSampler(n_components=num or 100)))
-    pipeline_list.append(('lr',LogisticRegression(warm_start=warm_start)))
-    clf = Pipeline(pipeline_list)
-    clf.fit(X,y)
-    proba = clf.predict_proba(X) #class 1 is learner, class 0 is expert
-    ratio = proba[:,1]*N_0/(proba[:,0]*N_1+EPS)
+        if name =='RuLSIF':
+            pipeline_list.append((f'{name}', None))
+            break
+    if pipeline_list[-1][0]=='RuLSIF':
+        feature_map = Pipeline(pipeline_list)
+        X_featurized = feature_map.fit_transform(X)
+        result = densratio(X_featurized[N_0:],X_featurized[:N_0],alpha=0)
+        ratio = result.compute_density_ratio(X_featurized)
+        print('JS lam,sig:',result.lambda_,result.kernel_info.sigma)
+    else:
+        pipeline_list.append(('lr',LogisticRegression(warm_start=warm_start)))
+        clf = Pipeline(pipeline_list)
+        clf.fit(X,y)
+        proba = clf.predict_proba(X) #class 1 is learner, class 0 is expert
+        ratio = proba[:,1]*N_0/(proba[:,0]*N_1+EPS)
     return ratio
 
 if 1:
     
-    N_samp0,N_samp1 = 200,800
-    dim = 20
+    N_samp0,N_samp1 = 100,100
+    dim = 2
 
     mu0 = np.zeros((dim,))
     mu1 = np.ones((dim,))*(dim**2)
@@ -71,22 +83,24 @@ if 1:
     ############################################################################
     #               Try out different things here!!!
     ############################################################################
-    estimation_pipelines = ['linear',
+    estimation_pipelines = ['poly-4',
                             'rff-100',
-                            'rff-100 poly-2']
+                            'RuLSIF',
+                            'poly-4 RuLSIF']
 
-    r_hats = [estimate_ratio_on_samps(x0,x1,pipe) for pipe in estimation_pipelines]
+    r_hats = [np.clip(estimate_ratio_on_samps(x0,x1,pipe),EPS,None) for pipe in estimation_pipelines]
+    
     r = r_true(X)
     print(max(r),min(r),np.mean(r),'r max min mean')
     plt.figure()
-    if dim==1:
+    if dim==1 and 0:
         plt.hist(x0[:,0],50,density=True,histtype='step',label='phat0',)
         plt.hist(x1[:,0],50,density=True,histtype='step',label='phat1',)
         plt.scatter(X[:,0],p_0(X),label='p0')
         plt.scatter(X[:,0],p_1(X),label='p1')
     else:
         plt.yscale('log')
-    plt.scatter(X[:,0],r,marker='.',label='r')
+    plt.scatter(X[:,0],r,marker='.',label='true ratio')
     for i in range(len(r_hats)):
         plt.scatter(X[:,0],r_hats[i],marker='+',label=estimation_pipelines[i],alpha=.2)
     
