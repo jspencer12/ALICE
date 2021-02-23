@@ -133,7 +133,7 @@ def get_state(env):
 def de_framestack(obs,*args,**kwargs):
     return obs[...,-1:]
 def add_batch_dim(obs,*args,**kwargs):
-    return obs[np.newaxis,:]
+    return np.array(obs)[np.newaxis,:]
 
 def warp_obs(obs,env_id,action_prev=None,add_history=True,kill_feats=None,**kw):
     if env_id in ATARI_ENVS:
@@ -516,23 +516,25 @@ def keras_NN(Obs_shape,A_dim,H_dims=[8],linear=True,seed=None,n_components=1,cnn
                                         kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg)(feats2)
         return tf.keras.Model(inputs=inp,outputs=logits)
     if linear:
-        model=tf.keras.Sequential()
-        model.add(tf.keras.layers.Dense(A_dim,input_shape=Obs_shape,kernel_initializer=initializer, bias_initializer=initializer,
-                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg))
-        return model
+        inp = tf.keras.Input(shape=Obs_shape)
+        cast_inp = tf.keras.layers.Lambda(lambda x: tf.cast(x,tf.float32)/tf.cast(255.0,tf.float32))(inp)
+        logits = tf.keras.layers.Dense(units=A_dim,input_shape=Obs_shape,kernel_initializer=initializer, bias_initializer=initializer,
+                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg,dtype=tf.float32)(cast_inp)
+        return tf.keras.Model(inputs=inp,outputs=logits)
     else:
-        model=tf.keras.Sequential()
-        model.add(tf.keras.layers.Dense(H_dims[0],input_shape=Obs_shape,activation='relu',kernel_initializer=initializer, bias_initializer=initializer,
-                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg))
+        inp = tf.keras.Input(shape=Obs_shape)
+        cast_inp = tf.keras.layers.Lambda(lambda x: tf.cast(x,tf.float32)/tf.cast(255.0,tf.float32))(inp)
+        middle = tf.keras.layers.Dense(H_dims[0],input_shape=Obs_shape,activation='relu',kernel_initializer=initializer, bias_initializer=initializer,
+                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg,dtype=tf.float32)(cast_inp)
         for i in range(1,len(H_dims)):
-            model.add(tf.keras.layers.Dense(H_dims[i],activation='relu',kernel_initializer=initializer, bias_initializer=initializer,
-                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg))
-        model.add(tf.keras.layers.Dense(A_dim,kernel_initializer=initializer,#activation='tanh',
-                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg))
+            middle = tf.keras.layers.Dense(H_dims[i],activation='relu',kernel_initializer=initializer, bias_initializer=initializer,
+                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg,dtype=tf.float32)(middle)
+        logits = tf.keras.layers.Dense(A_dim,kernel_initializer=initializer,#activation='tanh',
+                                        kernel_regularizer = reg, bias_regularizer = reg,activity_regularizer=reg,dtype=tf.float32)(middle)
         if clip_range is not None:
             print(clip_range)
-            model.add(tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x,clip_range[0],clip_range[1])))
-        return model
+            logits = tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x,clip_range[0],clip_range[1]))(logits)
+        return tf.keras.Model(inputs=inp,outputs=logits)
 def clone_model_and_weights(old_model):
     new_model = tf.keras.models.clone_model(old_model)
     new_model.set_weights(old_model.get_weights())
@@ -553,6 +555,7 @@ def train_model(model,dataframe,loss,learning_rate,N_epoch=20,batch_size=32,save
         model_a = lambda model_out,a: tf.gather_nd(model_out,a,batch_dims=1)
         dataframe.loc[:,'model_act_pre'] = np.argmax(batch_eval(model,np.vstack(dataframe['obs'].to_numpy())),axis=-1)
         dataframe.loc[:,'model_act_post']= -1*np.ones((len(dataframe),))
+
     train_results = dict()
     train_losses = []
     probs,advs = [],[]
@@ -1180,9 +1183,16 @@ def load_agg_save_safe(path,results_list=[]):
             cols = pd.read_csv(path,nrows=1).columns
         else:
             cols = results_list[0].columns
-        with portalocker.Lock(path) as f:
-            results_df = pd.concat(results_list,ignore_index=True)[cols] #cols here to ensure same column ordering
-            results_df.to_csv(f,index=False,header=f.tell()==0) #Adds header only to first line
+            os.makedirs(os.path.dirname(path),exist_ok=True)
+        if len(cols.difference(results_list[0].columns))==0: #Equality up to permutation
+            with portalocker.Lock(path) as f:
+                results_df = pd.concat(results_list,ignore_index=True)[cols]
+                results_df.to_csv(f,index=False,header=f.tell()==0) #Adds header only to first line
+        else:
+            new_df = pd.concat(results_list,ignore_index=True)[cols]
+            old_df = pd.read_csv(path)
+            joint_df = pd.concat([old_df,new_df],ignore_index=True)
+            joint_df.to_csv(path)
     return pd.read_csv(path)
     
 def load_agg_save(path,results_list=[]):
@@ -1288,7 +1298,7 @@ def plot_results(df,xaxis,yaxis,lines='alg',filters=None,**plotattrs):
     if save_dir is not None:
         plt.savefig(os.path.join(save_dir,figname))
 
-def print_results(env_ids,results_dir,exp_name,algs=['BC','BC+H'],params = None, filters = None,final=True,latex_table=False,data='reward'):
+def print_results(env_ids,results_dir,exp_name,algs=['BC','BC+H'],params = None, filters = None,final=True,format='print',data='reward'):
     # Format filters so all values are lists
     filters = {k:([filters[k]] if type(filters[k]) is not list else filters[k]) for k in filters} if filters is not None else dict()
     params = [params] if type(params) is str else params if params is not None else []
@@ -1297,55 +1307,69 @@ def print_results(env_ids,results_dir,exp_name,algs=['BC','BC+H'],params = None,
     # Build header string and calculate width
     N_cols = len(cols)
     N_alg = len(algs)
-    alg_hdrs = [alg + ' (# avg)' for alg in algs] 
-    if latex_table:
-        hdr_str = (' {:<20} &' + ' {:^15} &'*N_cols +' {:^14} &'+' {:^18} &'*N_alg).format('Environment',*[k[:15] for k in cols],'Expert (rew)',*algs_hdrs)
+    alg_w = 18
+    alg_hdrs = [(alg + ' (# avg)')[:18] for alg in algs] 
+    if format=='latex':
+        hdr_str = (' {:<20} &' + ' {:^15} &'*N_cols +' {:^14} &'+' {:^18} &'*N_alg).format('Environment',*[k[:15] for k in cols],'Expert (rew)',*alg_hdrs)
+    elif format=='csv':
+        hdr_str = ('{},' + ' {},'*N_cols +' {},'+' {},'*N_alg).format('Environment',*[k[:15] for k in cols],'Expert (rew)',*alg_hdrs)
     else:
-        hdr_str = ('| {:<20} |' + ' {:^15} |'*N_cols +' {:^14} |'+' {:^18} |'*N_alg).format('Environment',*[k[:15] for k in cols],'Expert (rew)',*alg_hdrs)
+        hdr_str = ('|{:^20}|' + '{:^10}|'*N_cols +'{:^12}|'+'{:^18}|'*N_alg).format('Environment',*[k[:10] for k in cols],'Expert (rew)',*alg_hdrs)
+        format = 'print'
     w = len(hdr_str)
     
-    print('-'*w+'\n|{0:^{1}}|\n'.format(data,w-2)+'-'*w)
-    print(hdr_str)
-    print('-'*w)
-    for env_id in env_ids:
-        if env_id[-2]=='_':
-            df = load_agg_save(results_dir+'results-'+env_id[:-2]+'--'+exp_name+'.csv')
+    datalist = [data] if type(data) is str else data
+    for data in datalist:
+        if format=='print':
+            print('-'*w+'\n|{0:^{1}}|\n'.format(data,w-2)+'-'*w)
+            print(hdr_str)
+            print('-'*w)
         else:
-            df = load_agg_save(results_dir+'results-'+env_id+'--'+exp_name+'.csv')
-        if final:
-            df = df[df['final']==True]
-        train_r_mean,train_r_std = df.loc[df.index[0],['train_r_mean','train_r_std']]
-        
-        lines_df = df[cols].drop_duplicates().dropna()
-        if len(filters)>0:
-            print('Filtered')
-            df = df[(df[filters.keys()].isin(filters)).all(axis=1)]
-        for i,line in lines_df.iterrows():
-            line_str = ['| {:<20} |'+' {:^15} |'*N_cols + '{:>8.0f}+-{:<5.0f} |',
-                        ' {:<20} '+'& {:^15} '*N_cols + '& ${:.1f}\pm {:.1f}$ '][latex_table].format(
-                            env_id,*[str(v) for v in line.values],train_r_mean,train_r_std)
-            for alg in algs:
-                linedict = {'alg':alg,**{k:v for k,v in zip(line.keys(),line.values)}}
-                index = (df[linedict.keys()]==linedict.values()).all(axis=1)
-                if sum(index)==0:
-                    #print((df[linedict.keys()]==linedict.values()).sum())
-                    #print(linedict.keys(),linedict.values())
-                    pass
-                df_line = df[(df[linedict.keys()]==linedict.values()).all(axis=1)]
-                data_vec = df_line[data].to_numpy()
-                #data_vec = np.array([np.mean(df[index & (df['opt_seed']==i)][data].to_numpy()) for i in pd.unique(df[index]['opt_seed'])])
-                data_mean = data_vec.mean() if len(data_vec)>0 else np.nan
-                if data == 'reward':
-                    N_pts = df_line['N_test_rollout'].to_numpy()
-                    rew_stds = df_line['reward_std'].to_numpy()
-                    pooled_std = (np.sum(N_pts*(rew_stds**2+data_vec**2))/N_pts.sum()-data_mean**2)**.5 if len(data_vec)>0 else np.nan
-                    # If all means are equal and N are the same, then pooled std is just mean of stds :O
-                    data_str = ['{:>8.0f}+-{:<5.0f} ({}) |','& ${:.1f}\pm {:.1f} ({})$ '][latex_table].format(data_mean,pooled_std,len(data_vec))
-                else:
-                    data_str = ['{:^15.5g} ({}) |','& ${:.5f} ({})$ '][latex_table].format(data_mean,len(data_vec))
-                line_str += data_str
-            print(line_str)
-    print('-'*w)
+            print(data)
+            print(hdr_str)
+        for env_id in env_ids:
+            if env_id[-2]=='_':
+                df = load_agg_save(results_dir+'results-'+env_id[:-2]+'--'+exp_name+'.csv')
+            else:
+                df = load_agg_save(results_dir+'results-'+env_id+'--'+exp_name+'.csv')
+            if final:
+                df = df[df['final']==True]
+            train_r_mean,train_r_std = df.loc[df.index[0],['train_r_mean','train_r_std']]
+            
+            lines_df = df[cols].drop_duplicates().dropna()
+            lines_df = lines_df.sort_values(cols)
+            if len(filters)>0:
+                print('Filtered')
+                df = df[(df[filters.keys()].isin(filters)).all(axis=1)]
+            for i,line in lines_df.iterrows():
+                line_str = {'print':'|{:^20}|'+'{:^10}|'*N_cols + '{:>6.0f}+-{:<4.0f}|',
+                            'latex':' {:<20} '+'& {:^15} '*N_cols + '& ${:.1f}\pm {:.1f}$ ',
+                            'csv':'{}'+', {}'*N_cols + ', {:.1f}+-{:.1f} ',}[format].format(
+                                env_id,*[str(v) for v in line.values],train_r_mean,train_r_std)
+                for alg in algs:
+                    linedict = {'alg':alg,**{k:v for k,v in zip(line.keys(),line.values)}}
+                    index = (df[linedict.keys()]==linedict.values()).all(axis=1)
+                    if sum(index)==0:
+                        #print((df[linedict.keys()]==linedict.values()).sum())
+                        #print(linedict.keys(),linedict.values())
+                        pass
+                    df_line = df[(df[linedict.keys()]==linedict.values()).all(axis=1)]
+                    data_vec = df_line[data].to_numpy()
+                    #data_vec = np.array([np.mean(df[index & (df['opt_seed']==i)][data].to_numpy()) for i in pd.unique(df[index]['opt_seed'])])
+                    data_mean = data_vec.mean() if len(data_vec)>0 else np.nan
+                    if data == 'reward':
+                        N_pts = df_line['N_test_rollout'].to_numpy()
+                        rew_stds = df_line['reward_std'].to_numpy()
+                        pooled_std = (np.sum(N_pts*(rew_stds**2+data_vec**2))/N_pts.sum()-data_mean**2)**.5 if len(data_vec)>0 else np.nan
+                        # If all means are equal and N are the same, then pooled std is just mean of stds :O
+                        data_str = {'print':'{:>7.0f}+-{:<5.0f} ({})|','csv':',{:.1f}+-{:.1f} ({})',
+                                    'latex':'& ${:.1f}\pm {:.1f} ({})$ '}[format].format(data_mean,pooled_std,len(data_vec))
+                    else:
+                        data_str = {'print':'{:^14.5g} ({})|','latex':'& ${:.5f} ({})$ ','csv':',{:.5f} ({})'}[format].format(data_mean,len(data_vec))
+                    line_str += data_str
+                print(line_str)
+        if format=='print':
+            print('-'*w)
 
 def argsparser():
     parser = argparse.ArgumentParser("Implementations of ALICE alg and IL baselines")
@@ -1574,15 +1598,23 @@ def alg_runner(alg,env_id,**kwargs):
                 reward,reward_std = np.mean(rewards),np.std(rewards)
             if verbose>2:
                 print('rew/std',reward,reward_std)
-            #hindsight_losses = [batch_avg_loss(train_loss,model,df_train,adversary_f) for model in model_list]
-            #best_ind = np.argmin(hindsight_losses) if alg != 'BC' else -1
+            
+            if i_agg>1:
+                hindsight_losses = [batch_avg_loss(train_loss,model,df_train,adversary_f,model_prob_a,entropy_coeff) for model in model_list]
+                best_ind = np.argmin(hindsight_losses)
+            else:
+                #df_train doesn't exist yet
+                best_ind = 0
+            
+            #These are results for policy trained on previous iteration, but rolled out at the beginning of this iteration
             results_dicts[i_agg-1].update({'w_max':df_E['weight'].max(), 'w_min':df_E['weight'].min(), 'final':False, 'iteration_num':i_agg-1,'horizon':horizon,
                                           'w_ESS':np.linalg.norm(df_E['weight'].to_numpy(),ord=1)**2/np.linalg.norm(df_E['weight'].to_numpy(),ord=2)**2,
                                           'reward':reward,'reward_std':reward_std, 'total_opt_steps':opt_steps_per_iter*i_agg,
+                                          'reward_curr':reward,'reward_std_curr':reward_std,
                                           'loss_test':batch_avg_loss(test_loss,model_list[-1],df_test,adversary_f,model_prob_a),
                                           'loss_train':batch_avg_loss(train_loss if i_agg>1 else test_loss,model_list[-1],df_train,adversary_f,model_prob_a,entropy_coeff),
                                           'class_test':batch_avg_loss(classification_loss,model_list[-1],df_test,adversary_f,model_prob_a),
-                                          'runtime':(time.time()-start_time)/60,'best_ind':i_agg-1,'JS_div':js_from_samples(df_L['obs_next'].values,df_E['obs_next'].values)})
+                                          'runtime':(time.time()-start_time)/60,'best_ind':best_ind,'JS_div':js_from_samples(df_L['obs_next'].values,df_E['obs_next'].values)})
             #print(df_L['i_agg'].values)
             
             ### Set up training dataset
@@ -1779,11 +1811,12 @@ def alg_runner(alg,env_id,**kwargs):
             results_dicts[i]['hindsight_loss_train'] = hindsight_losses[i]
         best_ind = np.argmin(hindsight_losses) if alg != 'BC' else len(model_list)-1
         
+        
         print('Hindsight Losses:',', '.join([f'{L:.4f}' for L in hindsight_losses]))
         
         #Score
         test_loss_val = batch_avg_loss(test_loss,model_list[best_ind],df_test,adversary_f,model_prob_a)
-        pi_rollout = lambda obs: np.squeeze(np.argmax(model_list[best_ind](obs),axis=-1)) if DISCRETE else np.squeeze(model_list[best_ind](obs))
+        pi_rollout = model2policy(model_list[best_ind])
         #for i,row in df_train[['obs','action']][:10].iterrows():
         #    print(row['action'],model_list[-1](row['obs']),pi_rollout(row['obs']))
         test_rollout_df = get_trajectories(pi_rollout,env_id,N_traj=N_test_rollout,render=render_final,obs_postprocess=learner_pre,
@@ -1793,16 +1826,20 @@ def alg_runner(alg,env_id,**kwargs):
 
         rewards = [np.sum(test_rollout_df[test_rollout_df['traj_ind']==i]['rew'].to_numpy()) for i in range(N_test_rollout)]
         reward,reward_std = np.mean(rewards),np.std(rewards)
+        reward_curr,reward_std_curr = _eval_pi_lightweight(model2policy(model_list[-1]),N_traj=N_test_rollout)
         print(passed_kwargs)
         print('{} {} {}   pi_{} train:{:.5f} test:{:.5f} reward:{:.1f}+-{:.1f} ({:.1f} m)'.format(env_id,N_E_traj,alg+Hstr,best_ind,hindsight_losses[best_ind],test_loss_val,reward,reward_std,(time.time()-start_time)/60))
 
         results_dicts[-1].update({'w_max':df_E['weight'].max(), 'w_min':df_E['weight'].min(), 'final':True, 'iteration_num':i_agg,'horizon':max_len,
                                   'w_ESS':np.linalg.norm(df_E['weight'].to_numpy(),ord=1)**2/np.linalg.norm(df_E['weight'].to_numpy(),ord=2)**2,
-                                  'reward':reward, 'reward_std':reward_std,'loss_test':test_loss_val,
+                                  'reward':reward, 'reward_std':reward_std,'loss_test':test_loss_val,'reward_curr':reward_curr, 'reward_std_curr':reward_std_curr,
                                   'loss_train':hindsight_losses[best_ind],'JS_div':js_from_samples(df_L['obs_next'].values,df_E['obs_next'].values),
                                   'class_test':batch_avg_loss(classification_loss,model_list[best_ind],df_test,adversary_f,model_prob_a),
                                   'runtime':(time.time()-start_time)/60,'best_ind':best_ind})
-                              
+
+        for i in range(len(results_dicts)):
+            results_dicts[i]['reward_hindsight_best'] = results_dicts[results_dicts[i]['best_ind']]['reward_curr']
+            results_dicts[i]['reward_std_hindsight_best'] = results_dicts[results_dicts[i]['best_ind']]['reward_std_curr']
 
     sample_env.close()
 
