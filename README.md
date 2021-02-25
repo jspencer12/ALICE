@@ -39,7 +39,7 @@ wget https://www.roboti.us/download/mjpro150_linux.zip
 mkdir ~/.mujoco
 unzip mjpro150_linux.zip -d ~/.mujoco
 sudo apt install python3.6-dev patchelf
-echo 'export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so' >> ~/.bashrc
+(maybe) echo 'export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so' >> ~/.bashrc
 echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/.mujoco/mjpro150/bin:/usr/lib/nvidia-418' >> ~/.bashrc
 (may possibly need) sudo apt-get install libosmesa6-dev
 pip install -U "mujoco-py<1.50.2>=1.50.1"

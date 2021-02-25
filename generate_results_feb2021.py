@@ -4,77 +4,31 @@ import multiprocessing as mp
 import pandas as pd
 import numpy as np
 from itertools import product
-exp_name = 'BC'
-results_dir = 'results_jan2021/'
-results_path = lambda env_id : 'results_jan2021/results-'+env_id+'--'+exp_name+'.csv'
+exp_name = 'ALICE'
+results_dir = 'results_feb2021/'
+results_path = lambda env_id : results_dir+'results-'+env_id+'--'+exp_name+'.csv'
 
-def print_results(env_ids,results_dir,exp_name,algs=['BC','BC+H'],params = None, filters = None,final=True,latex_table=False,data='reward'):
-    # Format filters so all values are lists
-    filters = {k:([filters[k]] if type(filters[k]) is not list else filters[k]) for k in filters} if filters is not None else dict()
-    params = [params] if type(params) is str else params if params is not None else []
-    cols = list(set(params) | set(filters.keys()))
-    
-    # Build header string and calculate width
-    N_cols = len(cols)
-    N_alg = len(algs)
-    alg_hdrs = [alg + ' (# avg)' for alg in algs] 
-    if latex_table:
-        hdr_str = (' {:<20} &' + ' {:^15} &'*N_cols +' {:^14} &'+' {:^18} &'*N_alg).format('Environment',*[k[:15] for k in cols],'Expert (rew)',*algs_hdrs)
-    else:
-        hdr_str = ('| {:<20} |' + ' {:^15} |'*N_cols +' {:^14} |'+' {:^18} |'*N_alg).format('Environment',*[k[:15] for k in cols],'Expert (rew)',*alg_hdrs)
-    w = len(hdr_str)
-    
-    print('-'*w+'\n|{0:^{1}}|\n'.format(data,w-2)+'-'*w)
-    print(hdr_str)
-    print('-'*w)
-    for env_id in env_ids:
-        if env_id[-2]=='_':
-            df = ALICE.load_agg_save(results_dir+'results-'+env_id[:-2]+'--'+exp_name+'.csv')
-        else:
-            df = ALICE.load_agg_save(results_dir+'results-'+env_id+'--'+exp_name+'.csv')
-        if final:
-            df = df[df['final']==True]
-        train_r_mean,train_r_std = df.loc[df.index[0],['train_r_mean','train_r_std']]
-        
-        lines_df = df[cols].drop_duplicates().dropna()
-        if len(filters)>0:
-            print('Filtered')
-            df = df[(df[filters.keys()].isin(filters)).all(axis=1)]
-        for i,line in lines_df.iterrows():
-            line_str = ['| {:<20} |'+' {:^15} |'*N_cols + '{:>8.0f}+-{:<5.0f} |',
-                        ' {:<20} '+'& {:^15} '*N_cols + '& ${:.1f}\pm {:.1f}$ '][latex_table].format(
-                            env_id,*[str(v) for v in line.values],train_r_mean,train_r_std)
-            for alg in algs:
-                linedict = {'alg':alg,**{k:v for k,v in zip(line.keys(),line.values)}}
-                index = (df[linedict.keys()]==linedict.values()).all(axis=1)
-                if sum(index)==0:
-                    #print((df[linedict.keys()]==linedict.values()).sum())
-                    #print(linedict.keys(),linedict.values())
-                    pass
-                df_line = df[(df[linedict.keys()]==linedict.values()).all(axis=1)]
-                data_vec = df_line[data].to_numpy()
-                #data_vec = np.array([np.mean(df[index & (df['opt_seed']==i)][data].to_numpy()) for i in pd.unique(df[index]['opt_seed'])])
-                data_mean = data_vec.mean() if len(data_vec)>0 else np.nan
-                if data == 'reward':
-                    N_pts = df_line['N_test_rollout'].to_numpy()
-                    rew_stds = df_line['reward_std'].to_numpy()
-                    pooled_std = (np.sum(N_pts*(rew_stds**2+data_vec**2))/N_pts.sum()-data_mean**2)**.5 if len(data_vec)>0 else np.nan
-                    # If all means are equal and N are the same, then pooled std is just mean of stds :O
-                    data_str = ['{:>8.0f}+-{:<5.0f} ({}) |','& ${:.1f}\pm {:.1f} ({})$ '][latex_table].format(data_mean,pooled_std,len(data_vec))
-                else:
-                    data_str = ['{:^15.5g} ({}) |','& ${:.5f} ({})$ '][latex_table].format(data_mean,len(data_vec))
-                line_str += data_str
-            print(line_str)
-    print('-'*w)
-
-# 
 if 0:
-    for env_id in ['CartPole-v1','Acrobot-v1','MountainCar-v0']:
+    ALICE.print_results(env_ids=['CartPole-v1'],results_dir=results_dir,params=['total_opt_steps','density_ratio_feature_map'],algs=['BC','BC+H','ALICE-Cov','ALICE-Cov+H'],exp_name='ALICE',data='loss_train',final=False)
+    ALICE.print_results(env_ids=['CartPole-v1'],results_dir=results_dir,params=['total_opt_steps','density_ratio_feature_map'],algs=['BC','BC+H','ALICE-Cov','ALICE-Cov+H'],exp_name='ALICE',data='reward',final=False)
+    ALICE.print_results(env_ids=['CartPole-v1'],results_dir=results_dir,params=['total_opt_steps','density_ratio_feature_map'],algs=['BC','BC+H','ALICE-Cov','ALICE-Cov+H'],exp_name='ALICE',data='class_test',final=False)
+
+if 1:
+    for env_id in ['CartPole-v1']: #,'Acrobot-v1','MountainCar-v0']:
         for j in range(7):
-            ALICE.alg_runner('BC',env_id,verbose=4,total_opt_steps=500000,N_epoch=10,N_E_traj=25,add_history=False,learning_rate=0.01,H_dims=(64,),
-                             N_agg_iter=5,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',results_path=results_path(env_id))
-            ALICE.alg_runner('BC',env_id,verbose=4,total_opt_steps=500000,N_epoch=10,N_E_traj=25,add_history=True,learning_rate=0.01,H_dims=(64,),
-                             N_agg_iter=5,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',results_path=results_path(env_id))
+            ALICE.alg_runner('ALICE-FAIL',env_id,verbose=4,total_opt_steps=750000,N_epoch=10,N_E_traj=25,add_history=False,learning_rate=0.01,H_dims=(64,),
+                             density_ratio_feature_map='standardscaler poly-2',density_ratio_alpha=1,
+                             adverary_feature_map='standardscaler poly-2', pair_with_E=True,
+                             N_agg_iter=30,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',results_path=results_path(env_id))
+            ALICE.alg_runner('ALICE-FAIL',env_id,verbose=4,total_opt_steps=750000,N_epoch=10,N_E_traj=25,add_history=True,learning_rate=0.01,H_dims=(64,),
+                             density_ratio_feature_map='standardscaler poly-2',density_ratio_alpha=1,
+                             adversary_feature_map='standardscaler poly-2', pair_with_E=True,
+                             N_agg_iter=30,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',results_path=results_path(env_id))
+            #ALICE.alg_runner('BC',env_id,verbose=0,total_opt_steps=750000,N_epoch=10,N_E_traj=25,add_history=False,learning_rate=0.01,H_dims=(64,),
+            #                 N_agg_iter=30,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',results_path=results_path(env_id))
+            #ALICE.alg_runner('BC',env_id,verbose=0,total_opt_steps=750000,N_epoch=10,N_E_traj=25,add_history=True,learning_rate=0.01,H_dims=(64,),
+            #                 N_agg_iter=30,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',results_path=results_path(env_id))
+
 if 0:
     env_id = 'HalfCheetah-v2'
     for j in range(7):
@@ -91,7 +45,7 @@ if 0:
         ALICE.alg_runner('BC',env_id,verbose=3,total_opt_steps=30000000,N_epoch=10,N_E_traj=25,add_history=True,learning_rate=0.0003,results_path=results_path(env_id),
                          N_agg_iter=10,opt_seed=j,run_seed=j,linear=False,RL_expert_folder='my_RL_experts',H_dims=[512,128,32])
 
-if 1:
+if 0:
     env_id = 'Ant-v2'
     for j in range(1):
         ALICE.alg_runner('BC',env_id,verbose=0,total_opt_steps=20000000,N_epoch=10,N_E_traj=25,add_history=False,learning_rate=0.001,results_path=results_path(env_id),
@@ -110,7 +64,7 @@ if 1:
 #64,64,0002,20M - 2811, 2634 (.1876/.2385)
 #64,64,001,40M - 3318, 3256 (.1608/.2260)
 
-if 1:
+if 0:
     env_id = 'Hopper-v2'
     for j in range(1):
         ALICE.alg_runner('BC',env_id,verbose=0,total_opt_steps=20000000,N_epoch=10,N_E_traj=25,add_history=False,learning_rate=0.001,results_path=results_path(env_id),
@@ -118,8 +72,8 @@ if 1:
         ALICE.alg_runner('BC',env_id,verbose=0,total_opt_steps=20000000,N_epoch=10,N_E_traj=25,add_history=True,learning_rate=0.001,results_path=results_path(env_id),
                          N_agg_iter=2,opt_seed=j,run_seed=j,RL_expert_folder='my_RL_experts',H_dims=[512,16,512])
           
-print_results(env_ids=['Hopper-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BC',data='loss_train')
-print_results(env_ids=['Hopper-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BC',data='reward')
+#print_results(env_ids=['Hopper-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BC',data='loss_train')
+#print_results(env_ids=['Hopper-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BC',data='reward')
 #print_results(env_ids=['Hopper-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BBC',data='reward',final=False)
 #print_results(env_ids=['Hopper-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BBC',data='loss_train',final=False)
 #1024,1024,001,20M-1734,1981(.0064,.0264)
@@ -140,9 +94,9 @@ if 0:
                          N_agg_iter=3,opt_seed=j,run_seed=j,RL_expert_folder='my_RL_experts',H_dims=[HD,HD])
 #print_results(env_ids=['Walker2d-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BC',data='reward',final=True)
 #print_results(env_ids=['Walker2d-v2'],results_dir=results_dir,params=['total_opt_steps','H_dims','learning_rate'],exp_name='BBC',data='reward',final=False)
-df = ALICE.load_agg_save(results_path('Hopper-v2'))
-plt.scatter(df['reward'].to_numpy(),df['loss_train'].to_numpy())
-plt.show()
+#df = ALICE.load_agg_save(results_path('Hopper-v2'))
+#plt.scatter(df['reward'].to_numpy(),df['loss_train'].to_numpy())
+#plt.show()
 
 # Walker
 #512,512,001,30M - 4209,4451 (.0056,.0281)* 4445+-2054, 3843+-2104
